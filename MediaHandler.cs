@@ -13,6 +13,8 @@ public sealed class MediaHandler
     private readonly AwsTranscribeService _awsTranscribeService;
     private IAudioSocket? _audioSocket;
     private bool _loggedFirstAudioFrame;
+    private int _pcmFrameCount;
+    private long _pcmBytesTotal;
 
     public MediaHandler(
         ILogger<MediaHandler> logger,
@@ -42,6 +44,8 @@ public sealed class MediaHandler
         _audioSocket = mediaSession.AudioSocket;
         _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
         _loggedFirstAudioFrame = false;
+        _pcmFrameCount = 0;
+        _pcmBytesTotal = 0;
 
         _logger.LogInformation("Media session initialized and audio event subscribed.");
         return mediaSession;
@@ -59,12 +63,25 @@ public sealed class MediaHandler
         _audioProcessor.BufferChunk(pcmChunk);
         _awsTranscribeService.SendAudioChunk(pcmChunk);
 
-        if (!_loggedFirstAudioFrame && pcmChunk.Length > 0)
+        if (pcmChunk.Length > 0)
         {
-            _loggedFirstAudioFrame = true;
-            _logger.LogInformation(
-                "First PCM chunk from Teams to Transcribe (length={Length} bytes). Speak in the meeting to drive transcription.",
-                pcmChunk.Length);
+            _pcmFrameCount++;
+            _pcmBytesTotal += pcmChunk.Length;
+
+            if (!_loggedFirstAudioFrame)
+            {
+                _loggedFirstAudioFrame = true;
+                _logger.LogInformation(
+                    "First PCM chunk from Teams to Transcribe (length={Length} bytes). Speak in the meeting to drive transcription.",
+                    pcmChunk.Length);
+            }
+            else if (_pcmFrameCount % 100 == 0)
+            {
+                _logger.LogInformation(
+                    "Teams audio still flowing: {Frames} PCM frames, {Kilobytes} KB total sent to Transcribe.",
+                    _pcmFrameCount,
+                    _pcmBytesTotal / 1024);
+            }
         }
 
         _logger.LogDebug(
