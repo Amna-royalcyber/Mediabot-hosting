@@ -323,8 +323,12 @@ public sealed class BotService
             }
         }
 
-        logger.LogWarning(
-            "Media Platform HttpSettings could not be applied (SDK surface changed). If initialization fails with 'address already in use', stop duplicate bot processes or adjust Media:HttpControlPort / Bot listen URL.");
+        // Skype Bots Media 1.31 documents HttpSettings only on internal hosts; public MediaPlatformSettings has no HttpSettings property.
+        // Instance TLS ports are MediaPlatformInstanceSettings.InstanceInternalPort / InstancePublicPort (e.g. 8445).
+        logger.LogInformation(
+            "Media Platform HttpSettings not exposed on MediaPlatformSettings in this SDK build (expected for 1.31). " +
+            "Media TLS uses InstanceInternalPort/InstancePublicPort on MediaPlatformInstanceSettings. " +
+            "If Kestrel reports 'address already in use', stop duplicate bot processes or change the ASP.NET listen URL / Media:HttpControlPort.");
     }
 }
 

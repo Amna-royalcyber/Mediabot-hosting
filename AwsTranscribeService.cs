@@ -26,6 +26,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private int _transcriptEventCount;
     private int _emptyTranscriptStreak;
     private int _partialLogCounter;
+    private int _initialResponseReceived;
 
     public AwsTranscribeService(
         ILogger<AwsTranscribeService> logger,
@@ -98,6 +99,9 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
             _activeResponse = await _client.StartStreamTranscriptionAsync(request, linkedCts.Token);
 
+            Interlocked.Exchange(ref _initialResponseReceived, 0);
+            LogStartStreamTranscriptionOutcome(_activeResponse);
+
             Interlocked.Exchange(ref _eventReceivedLogBudget, 40);
             Interlocked.Exchange(ref _chunksPublishedToSdk, 0);
             Interlocked.Exchange(ref _chunksEnqueuedFromTeams, 0);
@@ -115,6 +119,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
             stream.InitialResponseReceived += (_, _) =>
             {
+                Interlocked.Exchange(ref _initialResponseReceived, 1);
                 _logger.LogInformation("AWS Transcribe initial response received (session active).");
             };
 
@@ -158,6 +163,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
             LogTranscriptStreamDiagnostics(stream);
 
+            _ = WarnIfInitialResponseMissingAsync(linkedCts.Token);
+
             sessionReady.TrySetResult(true);
 
             // Keep the session task alive until shutdown; the SDK processes the response stream on background threads.
@@ -174,6 +181,43 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         {
             _logger.LogError(ex, "Failed to start AWS Transcribe streaming session");
             sessionReady.TrySetException(ex);
+        }
+    }
+
+    private void LogStartStreamTranscriptionOutcome(StartStreamTranscriptionResponse response)
+    {
+        try
+        {
+            var status = response.HttpStatusCode;
+            _logger.LogInformation(
+                "StartStreamTranscriptionAsync completed: HttpStatus={HttpStatus}, RequestId={RequestId}, SessionId={SessionId}, TranscriptResultStream={StreamPresent}.",
+                status,
+                response.RequestId ?? "(null)",
+                response.SessionId ?? "(null)",
+                response.TranscriptResultStream is not null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not log StartStreamTranscription response metadata.");
+        }
+    }
+
+    private async Task WarnIfInitialResponseMissingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken);
+            if (Volatile.Read(ref _initialResponseReceived) == 0)
+            {
+                _logger.LogWarning(
+                    "AWS Transcribe: InitialResponseReceived did not fire within 20s after StartStreamTranscriptionAsync. " +
+                    "Upload may still work; check outbound HTTPS/2 to transcribestreaming in this region, proxy/TLS inspection, and IAM transcribe:StartStreamTranscription. " +
+                    "If HttpStatus was 200 and events still never arrive, try upgrading AWSSDK.TranscribeStreaming or open a support ticket with RequestId logs.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
         }
     }
 
@@ -299,17 +343,25 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         try
         {
             var t = stream.GetType();
-            var isProcessing = t.GetProperty("IsProcessing", BindingFlags.Public | BindingFlags.Instance);
+            _logger.LogInformation("TranscriptResultStream runtime type: {TypeName}.", t.FullName ?? t.Name);
+            var isProcessing = t.GetProperty(
+                "IsProcessing",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (isProcessing is not null)
             {
                 _logger.LogInformation(
-                    "TranscriptResultStream.IsProcessing = {IsProcessing} (response reader should be active).",
+                    "TranscriptResultStream.IsProcessing = {IsProcessing} (if false, the SDK may not be reading the response stream yet).",
                     isProcessing.GetValue(stream));
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "TranscriptResultStream has no IsProcessing property on this SDK build; rely on InitialResponseReceived / transcript events.");
             }
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Could not read TranscriptResultStream diagnostic properties.");
+            _logger.LogInformation(ex, "Could not read TranscriptResultStream diagnostic properties.");
         }
     }
 
