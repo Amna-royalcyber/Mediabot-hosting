@@ -115,6 +115,10 @@ public sealed class CallHandler
         var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
         {
             TenantId = joinTenantId,
+            IsInteractiveRosterEnabled = true,
+            IsParticipantInfoUpdatesEnabled = true,
+            OptIntoDeltaRoster = true,
+            AllowGuestToBypassLobby = true,
         };
 
         if (!string.IsNullOrWhiteSpace(_settings.JoinMeetingSubject))
@@ -149,7 +153,15 @@ public sealed class CallHandler
 
         call.OnUpdated += (_, args) =>
         {
-            _logger.LogInformation("Call state updated. State: {State}", args.NewResource?.State);
+            var r = args.NewResource;
+            var ri = r?.ResultInfo;
+            _logger.LogInformation(
+                "Call updated. State={State}, Direction={Direction}, ResultCode={Code}, Subcode={Subcode}, Message={Message}",
+                r?.State,
+                r?.Direction,
+                ri?.Code,
+                ri?.Subcode,
+                ri?.Message);
         };
 
         _logger.LogInformation("Join request submitted. Call ID: {CallId}, ScenarioId={ScenarioId}", call.Id, scenarioId);
