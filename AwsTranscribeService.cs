@@ -161,6 +161,12 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 }
             };
 
+            // Event handlers alone do not read the HTTP/2 response body; the SDK requires an explicit start (see
+            // Amazon.Runtime.EventStreams.EventOutputStream / aws-sdk-net#3364). Without this, IsProcessing stays false
+            // and InitialResponseReceived / TranscriptEvent never fire.
+            stream.StartProcessing();
+            _logger.LogInformation("AWS Transcribe TranscriptResultStream.StartProcessing() invoked (response reader active).");
+
             LogTranscriptStreamDiagnostics(stream);
 
             _ = WarnIfInitialResponseMissingAsync(linkedCts.Token);
