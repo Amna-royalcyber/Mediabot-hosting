@@ -48,6 +48,8 @@ public static class Program
             MediaInstanceInternalPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_INTERNAL_PORT", "Media:InstanceInternalPort", 8445),
             MediaInstancePublicPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_PUBLIC_PORT", "Media:InstancePublicPort", 8445),
             MediaHttpControlPort = ReadInt(builder.Configuration, "BOT_MEDIA_HTTP_CONTROL_PORT", "Media:HttpControlPort", 5000),
+            MediaUdpPortMin = ReadOptionalUInt(builder.Configuration, "BOT_MEDIA_UDP_PORT_MIN", "Media:UdpPortMin"),
+            MediaUdpPortMax = ReadOptionalUInt(builder.Configuration, "BOT_MEDIA_UDP_PORT_MAX", "Media:UdpPortMax"),
             MediaServiceFqdn = ReadOptional(builder.Configuration, "BOT_MEDIA_SERVICE_FQDN", "Media:ServiceFqdn"),
             JoinMeetingSubject = ReadOptional(builder.Configuration, "BOT_JOIN_MEETING_SUBJECT", "Bot:JoinMeetingSubject")
         });
@@ -289,5 +291,22 @@ public static class Program
         }
 
         return defaultValue;
+    }
+
+    private static uint? ReadOptionalUInt(IConfiguration configuration, string envKey, string configKey)
+    {
+        var env = Environment.GetEnvironmentVariable(envKey);
+        if (!string.IsNullOrWhiteSpace(env) && uint.TryParse(env.Trim(), out var fromEnv))
+        {
+            return fromEnv;
+        }
+
+        var fromConfig = configuration[configKey];
+        if (!string.IsNullOrWhiteSpace(fromConfig) && uint.TryParse(fromConfig.Trim(), out var fromFile))
+        {
+            return fromFile;
+        }
+
+        return null;
     }
 }
