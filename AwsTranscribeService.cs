@@ -20,6 +20,9 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private TaskCompletionSource<bool>? _sessionReady;
     private StartStreamTranscriptionResponse? _activeResponse;
     private int _eventReceivedLogBudget = 40;
+    private long _chunksPublishedToSdk;
+    private int _transcriptEventCount;
+    private int _emptyTranscriptStreak;
 
     public AwsTranscribeService(
         ILogger<AwsTranscribeService> logger,
@@ -84,6 +87,9 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             _activeResponse = await _client.StartStreamTranscriptionAsync(request, linkedCts.Token);
 
             Interlocked.Exchange(ref _eventReceivedLogBudget, 40);
+            Interlocked.Exchange(ref _chunksPublishedToSdk, 0);
+            Interlocked.Exchange(ref _transcriptEventCount, 0);
+            Interlocked.Exchange(ref _emptyTranscriptStreak, 0);
 
             var stream = _activeResponse.TranscriptResultStream;
             stream.ExceptionReceived += (_, e) =>
@@ -101,16 +107,24 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             {
                 try
                 {
-                    if (Interlocked.Decrement(ref _eventReceivedLogBudget) >= 0)
-                    {
-                        _logger.LogInformation(
-                            "Transcribe EventReceived: {Type}",
-                            e.EventStreamEvent?.GetType().FullName ?? "(null)");
-                    }
-
                     if (e.EventStreamEvent is TranscriptEvent te)
                     {
+                        var c = Interlocked.Increment(ref _transcriptEventCount);
+                        if (c == 1 || c % 25 == 0)
+                        {
+                            _logger.LogInformation(
+                                "Transcribe TranscriptEvent #{Ordinal}: {ResultCount} result(s).",
+                                c,
+                                te.Transcript?.Results?.Count ?? 0);
+                        }
+
                         HandleTranscriptResult(te);
+                    }
+                    else if (Interlocked.Decrement(ref _eventReceivedLogBudget) >= 0)
+                    {
+                        _logger.LogInformation(
+                            "Transcribe EventReceived (non-transcript): {Type}",
+                            e.EventStreamEvent?.GetType().FullName ?? "(null)");
                     }
                 }
                 catch (Exception ex)
@@ -153,9 +167,11 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     {
         if (transcriptEvent.Transcript?.Results is null)
         {
+            _logger.LogDebug("TranscriptEvent had null Transcript.Results.");
             return;
         }
 
+        var anyText = false;
         foreach (var result in transcriptEvent.Transcript.Results)
         {
             if (result.Alternatives.Count == 0)
@@ -169,6 +185,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 continue;
             }
 
+            anyText = true;
             var kind = result.IsPartial == true ? "Partial" : "Final";
             if (kind == "Final")
             {
@@ -180,6 +197,18 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             }
 
             _ = _transcriptBroadcaster.BroadcastAsync(kind, text);
+        }
+
+        if (!anyText && transcriptEvent.Transcript.Results.Count > 0)
+        {
+            var n = Interlocked.Increment(ref _emptyTranscriptStreak);
+            if (n <= 3 || n % 200 == 0)
+            {
+                _logger.LogWarning(
+                    "Transcribe had {ResultCount} result row(s) but no usable text (occurrence {Occurrence}). If this persists, verify 16 kHz mono PCM (stereo mislabeled as mono breaks transcription).",
+                    transcriptEvent.Transcript.Results.Count,
+                    n);
+            }
         }
     }
 
@@ -194,6 +223,14 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
             if (_audioQueue.TryDequeue(out byte[]? chunk) && chunk.Length > 0)
             {
+                var n = Interlocked.Increment(ref _chunksPublishedToSdk);
+                if (n % 1000 == 0)
+                {
+                    _logger.LogInformation(
+                        "AWS Transcribe publisher delivered {Chunks} audio chunks to the SDK (upload path OK).",
+                        n);
+                }
+
                 return new AudioEvent
                 {
                     AudioChunk = new MemoryStream(chunk, writable: false)
