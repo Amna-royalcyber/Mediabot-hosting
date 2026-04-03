@@ -12,6 +12,19 @@ public static class Program
     {
         var builder = WebApplication.CreateBuilder(args);
 
+        // Kestrel URL must differ from the Media Platform's internal HTTP listener (see BotService + Media:HttpControlPort).
+        // nginx should proxy to this port (default 5080). Override with BOT_HTTP_LISTEN_URL or Bot:ListenUrl.
+        var appListenUrl = Environment.GetEnvironmentVariable("BOT_HTTP_LISTEN_URL");
+        if (string.IsNullOrWhiteSpace(appListenUrl))
+        {
+            appListenUrl = builder.Configuration["Bot:ListenUrl"];
+        }
+        if (string.IsNullOrWhiteSpace(appListenUrl))
+        {
+            appListenUrl = "http://127.0.0.1:5080";
+        }
+        builder.WebHost.UseUrls(appListenUrl.Trim());
+
         builder.Logging.ClearProviders();
         builder.Logging.AddConsole();
 
@@ -34,6 +47,7 @@ public static class Program
             MediaPublicIp = GetConfig(builder.Configuration, "BOT_MEDIA_PUBLIC_IP", "Media:PublicIp"),
             MediaInstanceInternalPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_INTERNAL_PORT", "Media:InstanceInternalPort", 8445),
             MediaInstancePublicPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_PUBLIC_PORT", "Media:InstancePublicPort", 8445),
+            MediaHttpControlPort = ReadInt(builder.Configuration, "BOT_MEDIA_HTTP_CONTROL_PORT", "Media:HttpControlPort", 5000),
             MediaServiceFqdn = ReadOptional(builder.Configuration, "BOT_MEDIA_SERVICE_FQDN", "Media:ServiceFqdn"),
             JoinMeetingSubject = ReadOptional(builder.Configuration, "BOT_JOIN_MEETING_SUBJECT", "Bot:JoinMeetingSubject")
         });

@@ -9,6 +9,7 @@ using Microsoft.Graph.Communications.Common.Telemetry;
 using Microsoft.Skype.Bots.Media;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Reflection;
 
 namespace TeamsMediaBot;
 
@@ -28,6 +29,9 @@ public sealed class BotSettings
 
     public int MediaInstanceInternalPort { get; init; } = 8445;
     public int MediaInstancePublicPort { get; init; } = 8445;
+
+    /// <summary>Port for the Media Platform HTTP control listener (Skype HttpSettings), not the ASP.NET listen port.</summary>
+    public int MediaHttpControlPort { get; init; } = 5000;
 
     /// <summary>Optional; defaults to host from Bot callback URL.</summary>
     public string? MediaServiceFqdn { get; init; }
@@ -189,6 +193,12 @@ public sealed class BotService
             }
         };
 
+        TryApplyMediaHttpControlSettings(
+            mediaPlatformSettings,
+            _settings.MediaHttpControlPort,
+            _settings.MediaHttpControlPort,
+            _logger);
+
         return new CommunicationsClientBuilder(
                 _settings.ClientId,
                 _settings.ClientId,
@@ -198,6 +208,66 @@ public sealed class BotService
             .SetNotificationUrl(notificationUri)
             .SetMediaPlatformSettings(mediaPlatformSettings)
             .Build();
+    }
+
+    /// <summary>
+    /// The Media Platform opens a separate HTTP listener (HttpSettings). Without this, it reuses the app's URL/port and collides with Kestrel.
+    /// The public API may not expose HttpSettings; set it via reflection when available.
+    /// </summary>
+    private static void TryApplyMediaHttpControlSettings(
+        MediaPlatformSettings settings,
+        int internalPort,
+        int publicPort,
+        ILogger logger)
+    {
+        var httpSettingsType = typeof(MediaPlatform).Assembly.GetType("Microsoft.Skype.Bots.Media.HttpSettings");
+        if (httpSettingsType is null)
+        {
+            logger.LogWarning("Could not resolve Microsoft.Skype.Bots.Media.HttpSettings; media may share Kestrel's port.");
+            return;
+        }
+
+        var http = Activator.CreateInstance(httpSettingsType);
+        if (http is null)
+        {
+            logger.LogWarning("Could not create HttpSettings instance.");
+            return;
+        }
+
+        httpSettingsType.GetProperty("InstanceInternalPort")?.SetValue(http, internalPort);
+        httpSettingsType.GetProperty("InstancePublicPort")?.SetValue(http, publicPort);
+
+        var t = typeof(MediaPlatformSettings);
+        foreach (var prop in t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            if (prop.PropertyType == httpSettingsType && prop.CanWrite)
+            {
+                prop.SetValue(settings, http);
+                logger.LogInformation(
+                    "Media Platform HTTP control ports set ({Internal}, {Public}) via {Name}.",
+                    internalPort,
+                    publicPort,
+                    prop.Name);
+                return;
+            }
+        }
+
+        foreach (var field in t.GetFields(BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            if (field.FieldType == httpSettingsType)
+            {
+                field.SetValue(settings, http);
+                logger.LogInformation(
+                    "Media Platform HTTP control ports set ({Internal}, {Public}) via field {Name}.",
+                    internalPort,
+                    publicPort,
+                    field.Name);
+                return;
+            }
+        }
+
+        logger.LogWarning(
+            "Media Platform HttpSettings could not be applied (SDK surface changed). If initialization fails with 'address already in use', stop duplicate bot processes or adjust Media:HttpControlPort / Bot listen URL.");
     }
 }
 
