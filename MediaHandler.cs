@@ -57,7 +57,7 @@ public sealed class MediaHandler
         _audioProcessor.BufferChunk(pcmChunk);
         _awsTranscribeService.SendAudioChunk(pcmChunk);
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "Audio frame received and buffered. Timestamp: {Timestamp}, Length: {Length}",
             incomingFrame.Timestamp,
             incomingFrame.Length);

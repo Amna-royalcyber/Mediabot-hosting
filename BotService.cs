@@ -92,7 +92,6 @@ public sealed class BotService
         }
 
         _logger.LogInformation("Joining Teams meeting (Graph Communications).");
-        await _awsTranscribeService.StartStreaming();
 
         if (!string.IsNullOrWhiteSpace(request.MeetingJoinUrl))
         {
@@ -119,6 +118,10 @@ public sealed class BotService
         }
 
         _logger.LogInformation("Join request submitted to Graph.");
+
+        // Start Transcribe after join so media can produce PCM before the SDK pulls the first audio chunk (avoids deadlock if the stream waits for upstream audio).
+        await _awsTranscribeService.StartStreamingAsync();
+        _logger.LogInformation("AWS Transcribe streaming session started for this meeting.");
     }
 
     public Task<HttpResponseMessage> ProcessNotificationAsync(HttpRequestMessage request)

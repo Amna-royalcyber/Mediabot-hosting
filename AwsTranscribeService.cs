@@ -16,22 +16,34 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private readonly AmazonTranscribeStreamingClient _client;
 
     private Task? _streamingTask;
+    private TaskCompletionSource<bool>? _sessionReady;
     private StartStreamTranscriptionResponse? _activeResponse;
 
-    public AwsTranscribeService(ILogger<AwsTranscribeService> logger, TranscriptBroadcaster transcriptBroadcaster)
+    public AwsTranscribeService(
+        ILogger<AwsTranscribeService> logger,
+        TranscriptBroadcaster transcriptBroadcaster,
+        BotSettings settings)
     {
         _logger = logger;
         _transcriptBroadcaster = transcriptBroadcaster;
-        var regionName = Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1";
+        var regionName = !string.IsNullOrWhiteSpace(settings.AwsRegion)
+            ? settings.AwsRegion
+            : (Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1");
+        _logger.LogInformation("AWS Transcribe Streaming client region: {Region}", regionName);
         _client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(regionName));
     }
 
-    public Task StartStreaming()
+    /// <summary>
+    /// Starts a single long-lived Transcribe session. Awaits until the stream is accepted or fails (credentials, region, network).
+    /// </summary>
+    public async Task StartStreamingAsync(CancellationToken cancellationToken = default)
     {
         if (_streamingTask is not null)
         {
-            return Task.CompletedTask;
+            return;
         }
+
+        _sessionReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var request = new StartStreamTranscriptionRequest
         {
@@ -41,21 +53,81 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             AudioStreamPublisher = GetNextAudioEventAsync
         };
 
-        _streamingTask = Task.Run(async () =>
+        _streamingTask = RunStreamingSessionAsync(request, _sessionReady, cancellationToken);
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+        try
         {
-            _activeResponse = await _client.StartStreamTranscriptionAsync(request, _cts.Token);
-            _activeResponse.TranscriptResultStream.TranscriptEventReceived += (_, e) =>
+            await _sessionReady.Task.WaitAsync(linked.Token);
+        }
+        catch
+        {
+            _streamingTask = null;
+            _sessionReady = null;
+            _activeResponse = null;
+            throw;
+        }
+    }
+
+    private async Task RunStreamingSessionAsync(
+        StartStreamTranscriptionRequest request,
+        TaskCompletionSource<bool> sessionReady,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+            _activeResponse = await _client.StartStreamTranscriptionAsync(request, linkedCts.Token);
+
+            var stream = _activeResponse.TranscriptResultStream;
+            stream.ExceptionReceived += (_, e) =>
             {
-                HandleTranscriptResult(e.EventStreamEvent);
+                _logger.LogError(e.EventStreamException, "AWS Transcribe stream exception");
             };
 
-            while (!_cts.IsCancellationRequested)
+            stream.InitialResponseReceived += (_, _) =>
             {
-                await Task.Delay(1000, _cts.Token);
-            }
-        }, _cts.Token);
+                _logger.LogInformation("AWS Transcribe initial response received (session active).");
+            };
 
-        return Task.CompletedTask;
+            stream.TranscriptEventReceived += (_, e) =>
+            {
+                try
+                {
+                    if (e.EventStreamEvent is TranscriptEvent te)
+                    {
+                        HandleTranscriptResult(te);
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "Transcript stream event type: {Type}",
+                            e.EventStreamEvent?.GetType().FullName ?? "(null)");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error handling TranscriptEvent");
+                }
+            };
+
+            sessionReady.TrySetResult(true);
+
+            // Keep the session task alive until shutdown; the SDK processes the response stream on background threads.
+            try
+            {
+                await Task.Delay(Timeout.Infinite, _cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected on dispose.
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to start AWS Transcribe streaming session");
+            sessionReady.TrySetException(ex);
+        }
     }
 
     public void SendAudioChunk(byte[] data)
@@ -71,6 +143,11 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
     public void HandleTranscriptResult(TranscriptEvent transcriptEvent)
     {
+        if (transcriptEvent.Transcript?.Results is null)
+        {
+            return;
+        }
+
         foreach (var result in transcriptEvent.Transcript.Results)
         {
             if (result.Alternatives.Count == 0)
@@ -85,27 +162,38 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             }
 
             var kind = result.IsPartial == true ? "Partial" : "Final";
-            Console.WriteLine($"[{kind}] {text}");
+            if (kind == "Final")
+            {
+                _logger.LogInformation("Transcribe final: {Text}", text);
+            }
+            else
+            {
+                _logger.LogDebug("Transcribe partial: {Text}", text);
+            }
+
             _ = _transcriptBroadcaster.BroadcastAsync(kind, text);
         }
     }
 
+    /// <summary>
+    /// Pulls the next non-empty PCM chunk. Never sends an empty chunk (can confuse or end the Transcribe stream).
+    /// </summary>
     private async Task<IAudioStreamEvent> GetNextAudioEventAsync()
     {
-        await _audioSignal.WaitAsync(_cts.Token);
-
-        if (_audioQueue.TryDequeue(out byte[]? chunk))
+        while (!_cts.IsCancellationRequested)
         {
-            return new AudioEvent
+            await _audioSignal.WaitAsync(_cts.Token);
+
+            if (_audioQueue.TryDequeue(out byte[]? chunk) && chunk.Length > 0)
             {
-                AudioChunk = new MemoryStream(chunk, writable: false)
-            };
+                return new AudioEvent
+                {
+                    AudioChunk = new MemoryStream(chunk, writable: false)
+                };
+            }
         }
 
-        return new AudioEvent
-        {
-            AudioChunk = new MemoryStream(Array.Empty<byte>(), writable: false)
-        };
+        throw new OperationCanceledException(_cts.Token);
     }
 
     public async ValueTask DisposeAsync()
