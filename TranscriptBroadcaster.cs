@@ -18,7 +18,9 @@ public sealed class TranscriptBroadcaster
         string kind,
         string text,
         string? awsSpeakerId = null,
-        string? speakerLabel = null)
+        string? speakerLabel = null,
+        string? userPrincipalName = null,
+        string? azureAdObjectId = null)
     {
         try
         {
@@ -28,6 +30,8 @@ public sealed class TranscriptBroadcaster
                 text,
                 awsSpeakerId,
                 speakerLabel,
+                userPrincipalName,
+                azureAdObjectId,
                 timestamp = DateTimeOffset.UtcNow
             });
         }
@@ -37,13 +41,19 @@ public sealed class TranscriptBroadcaster
         }
     }
 
-    public async Task BroadcastRosterAsync(IReadOnlyList<(string Id, string DisplayName)> participants)
+    public async Task BroadcastRosterAsync(IReadOnlyList<RosterParticipantDto> participants)
     {
         try
         {
             await _hubContext.Clients.All.SendAsync("roster", new
             {
-                participants = participants.Select(p => new { id = p.Id, displayName = p.DisplayName }).ToList(),
+                participants = participants.Select(p => new
+                {
+                    id = p.CallParticipantId,
+                    displayName = p.DisplayName,
+                    azureAdObjectId = p.AzureAdObjectId,
+                    userPrincipalName = p.UserPrincipalName
+                }).ToList(),
                 timestamp = DateTimeOffset.UtcNow
             });
         }

@@ -51,10 +51,12 @@ public static class Program
             MediaUdpPortMin = ReadOptionalUInt(builder.Configuration, "BOT_MEDIA_UDP_PORT_MIN", "Media:UdpPortMin"),
             MediaUdpPortMax = ReadOptionalUInt(builder.Configuration, "BOT_MEDIA_UDP_PORT_MAX", "Media:UdpPortMax"),
             MediaServiceFqdn = ReadOptional(builder.Configuration, "BOT_MEDIA_SERVICE_FQDN", "Media:ServiceFqdn"),
-            JoinMeetingSubject = ReadOptional(builder.Configuration, "BOT_JOIN_MEETING_SUBJECT", "Bot:JoinMeetingSubject")
+            JoinMeetingSubject = ReadOptional(builder.Configuration, "BOT_JOIN_MEETING_SUBJECT", "Bot:JoinMeetingSubject"),
+            TranscriptBroadcastPartials = ReadBool(builder.Configuration, "BOT_TRANSCRIPT_BROADCAST_PARTIALS", "Bot:TranscriptBroadcastPartials", defaultValue: false)
         });
 
         builder.Services.AddSingleton<TranscriptBroadcaster>();
+        builder.Services.AddSingleton<EntraUserResolver>();
         builder.Services.AddSingleton<MeetingParticipantService>();
         builder.Services.AddSingleton<AudioProcessor>();
         builder.Services.AddSingleton<AwsTranscribeService>();
@@ -289,6 +291,23 @@ public static class Program
         if (!string.IsNullOrWhiteSpace(fromConfig) && int.TryParse(fromConfig.Trim(), out var fromFile))
         {
             return fromFile;
+        }
+
+        return defaultValue;
+    }
+
+    private static bool ReadBool(IConfiguration configuration, string envKey, string configKey, bool defaultValue)
+    {
+        var env = Environment.GetEnvironmentVariable(envKey);
+        if (!string.IsNullOrWhiteSpace(env))
+        {
+            return env.Trim() is "1" or "true" or "True" or "yes" or "Yes";
+        }
+
+        var fromConfig = configuration[configKey];
+        if (!string.IsNullOrWhiteSpace(fromConfig))
+        {
+            return fromConfig.Trim() is "1" or "true" or "True" or "yes" or "Yes";
         }
 
         return defaultValue;

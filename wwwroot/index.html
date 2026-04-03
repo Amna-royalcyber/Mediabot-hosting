@@ -11,10 +11,14 @@
     input { flex: 1; padding: 10px; }
     button { padding: 10px 14px; cursor: pointer; }
     #status { margin: 10px 0; color: #1f4f8f; }
+    #roster { margin: 10px 0; padding: 10px; background: #f5f7fa; border-radius: 6px; font-size: 14px; }
+    #roster .tag { display: inline-block; margin: 2px 6px 2px 0; padding: 2px 8px; background: #e8eef7; border-radius: 4px; }
     #transcripts { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 260px; }
     .line { margin: 6px 0; }
     .partial { color: #666; }
     .final { color: #111; font-weight: 600; }
+    .speaker { color: #0d47a1; font-weight: 600; margin-right: 6px; }
+    .aad-id { font-size: 11px; color: #555; font-weight: normal; }
   </style>
 </head>
 <body>
@@ -27,11 +31,13 @@
   </div>
 
   <div id="status">Connecting to transcript stream...</div>
+  <div id="roster" hidden></div>
   <div id="transcripts"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.7/signalr.min.js"></script>
   <script>
     const statusEl = document.getElementById("status");
+    const rosterEl = document.getElementById("roster");
     const transcriptsEl = document.getElementById("transcripts");
     const meetingUrlEl = document.getElementById("meetingUrl");
     const joinBtn = document.getElementById("joinBtn");
@@ -41,12 +47,41 @@
       .withAutomaticReconnect()
       .build();
 
+    connection.on("roster", (payload) => {
+      const list = payload.participants || [];
+      if (list.length === 0) {
+        rosterEl.hidden = true;
+        rosterEl.textContent = "";
+        return;
+      }
+      rosterEl.hidden = false;
+      rosterEl.innerHTML = "<strong>In this meeting (Microsoft Entra)</strong> " +
+        list.map((p) => {
+          const name = p.displayName || p.id || "";
+          const upn = p.userPrincipalName ? ` — ${p.userPrincipalName}` : "";
+          const oid = p.azureAdObjectId ? ` [object ID: ${p.azureAdObjectId}]` : "";
+          return `<span class="tag" title="${escapeHtml((p.userPrincipalName || "") + (p.azureAdObjectId || ""))}">${escapeHtml(name)}${escapeHtml(upn)}${escapeHtml(oid)}</span>`;
+        }).join("");
+    });
+
     connection.on("transcript", (message) => {
       const line = document.createElement("div");
       line.className = `line ${message.kind === "Final" ? "final" : "partial"}`;
-      line.textContent = `[${message.kind}] ${message.text}`;
+      const who = message.speakerLabel
+        ? `<span class="speaker">${escapeHtml(message.speakerLabel)}</span>`
+        : "";
+      const oid = message.azureAdObjectId
+        ? ` <span class="aad-id" title="Azure AD object ID">${escapeHtml(message.azureAdObjectId)}</span>`
+        : "";
+      line.innerHTML = `${who}[${message.kind}] ${escapeHtml(message.text || "")}${oid}`;
       transcriptsEl.prepend(line);
     });
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
 
     async function startHub() {
       try {

@@ -46,6 +46,9 @@ public sealed class BotSettings
 
     /// <summary>Optional. Sets <see cref="JoinMeetingParameters.Subject"/> so the participant can show a clearer name in the roster (Azure Bot display name is also used by Teams).</summary>
     public string? JoinMeetingSubject { get; init; }
+
+    /// <summary>If true, partial transcripts are broadcast to SignalR. Default false (finals only, less noise).</summary>
+    public bool TranscriptBroadcastPartials { get; init; }
 }
 
 public sealed class BotService

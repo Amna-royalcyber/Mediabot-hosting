@@ -8,24 +8,31 @@ namespace TeamsMediaBot;
 
 /// <summary>
 /// Tracks Teams meeting participants from Graph Communications roster updates and maps
-/// AWS Transcribe speaker ids (spk_0, spk_1, …) to display names by <b>stable join order</b>
-/// (excluding the bot application). AWS assigns spk_* by audio diarization, which may not match
-/// speaking order or roster order — treat names as best-effort when multiple humans speak.
+/// AWS Transcribe speaker ids (spk_0, spk_1, …) to Entra profiles by <b>first-seen user order</b>
+/// (excluding the bot application). AWS diarization may not match speaking order — labels are best-effort.
 /// </summary>
 public sealed class MeetingParticipantService
 {
     private static readonly Regex AwsSpeakerIndex = new(@"^spk_(\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly TranscriptBroadcaster _broadcaster;
+    private readonly EntraUserResolver _entra;
     private readonly ILogger<MeetingParticipantService> _logger;
     private readonly object _lock = new();
 
-    private readonly List<RosterEntry> _rosterOrder = new();
-    private readonly Dictionary<string, string> _idToDisplayName = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Call participant resource ids (for removals).</summary>
+    private readonly Dictionary<string, string> _callParticipantIdToAzureUserId = new(StringComparer.OrdinalIgnoreCase);
 
-    public MeetingParticipantService(TranscriptBroadcaster broadcaster, ILogger<MeetingParticipantService> logger)
+    /// <summary>Stable order of human participants for spk_N → row N mapping.</summary>
+    private readonly List<RosterEntry> _rosterOrder = new();
+
+    public MeetingParticipantService(
+        TranscriptBroadcaster broadcaster,
+        EntraUserResolver entra,
+        ILogger<MeetingParticipantService> logger)
     {
         _broadcaster = broadcaster;
+        _entra = entra;
         _logger = logger;
     }
 
@@ -57,11 +64,11 @@ public sealed class MeetingParticipantService
             }
         };
 
-        _logger.LogInformation("Subscribed to call participant roster updates for speaker name hints.");
+        _logger.LogInformation("Subscribed to call participant roster updates; Entra profiles resolved via Microsoft Graph when needed.");
     }
 
-    /// <summary>Best-effort: maps spk_N to the Nth non-bot participant in first-seen roster order.</summary>
-    public string? TryResolveTeamsDisplayName(string? awsSpeakerId)
+    /// <summary>Maps spk_N to the Nth human participant row (first-seen Azure AD user order).</summary>
+    public SpeakerResolution? TryResolveSpeaker(string? awsSpeakerId)
     {
         if (string.IsNullOrEmpty(awsSpeakerId))
         {
@@ -78,7 +85,11 @@ public sealed class MeetingParticipantService
         {
             if (idx < _rosterOrder.Count)
             {
-                return _rosterOrder[idx].DisplayName;
+                var e = _rosterOrder[idx];
+                return new SpeakerResolution(
+                    e.DisplayName,
+                    e.UserPrincipalName,
+                    e.AzureAdObjectId);
             }
         }
 
@@ -98,58 +109,118 @@ public sealed class MeetingParticipantService
             return;
         }
 
-        var displayName = ResolveDisplayName(resource);
-        if (string.IsNullOrWhiteSpace(displayName))
+        var azureUserId = resource.Info?.Identity?.User?.Id;
+        if (string.IsNullOrWhiteSpace(azureUserId))
         {
             return;
         }
 
-        displayName = displayName.Trim();
-        var id = resource.Id;
-        if (string.IsNullOrWhiteSpace(id))
+        azureUserId = azureUserId.Trim();
+        var callPartId = resource.Id;
+        if (string.IsNullOrWhiteSpace(callPartId))
         {
             return;
         }
 
+        var fromCall = resource.Info!.Identity!.User!.DisplayName?.Trim();
+        var displayName = string.IsNullOrWhiteSpace(fromCall) ? null : fromCall;
+
+        var needsGraph = string.IsNullOrWhiteSpace(displayName);
         lock (_lock)
         {
-            if (_idToDisplayName.TryGetValue(id, out var existing))
+            _callParticipantIdToAzureUserId[callPartId] = azureUserId;
+
+            var existingIdx = -1;
+            for (var i = 0; i < _rosterOrder.Count; i++)
             {
-                if (!string.Equals(existing, displayName, StringComparison.Ordinal))
+                if (string.Equals(_rosterOrder[i].AzureAdObjectId, azureUserId, StringComparison.OrdinalIgnoreCase))
                 {
-                    _idToDisplayName[id] = displayName;
-                    for (var i = 0; i < _rosterOrder.Count; i++)
-                    {
-                        if (string.Equals(_rosterOrder[i].Id, id, StringComparison.OrdinalIgnoreCase))
-                        {
-                            _rosterOrder[i] = new RosterEntry(id, displayName);
-                            break;
-                        }
-                    }
+                    existingIdx = i;
+                    break;
+                }
+            }
+
+            if (existingIdx >= 0)
+            {
+                var cur = _rosterOrder[existingIdx];
+                if (!string.IsNullOrWhiteSpace(displayName))
+                {
+                    _rosterOrder[existingIdx] = cur with { DisplayName = displayName };
                 }
             }
             else
             {
-                _idToDisplayName[id] = displayName;
-                _rosterOrder.Add(new RosterEntry(id, displayName));
+                _rosterOrder.Add(new RosterEntry(
+                    callPartId,
+                    azureUserId,
+                    displayName ?? azureUserId,
+                    UserPrincipalName: null));
             }
         }
 
         _ = PublishRosterAsync();
+
+        if (needsGraph)
+        {
+            _ = EnrichFromGraphAsync(azureUserId);
+        }
+    }
+
+    private async Task EnrichFromGraphAsync(string azureUserId)
+    {
+        try
+        {
+            var profile = await _entra.GetUserAsync(azureUserId).ConfigureAwait(false);
+            if (profile is null)
+            {
+                return;
+            }
+
+            var dn = string.IsNullOrWhiteSpace(profile.DisplayName) ? profile.Id : profile.DisplayName.Trim();
+            var upn = profile.UserPrincipalName;
+
+            lock (_lock)
+            {
+                for (var i = 0; i < _rosterOrder.Count; i++)
+                {
+                    if (!string.Equals(_rosterOrder[i].AzureAdObjectId, azureUserId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    _rosterOrder[i] = _rosterOrder[i] with
+                    {
+                        DisplayName = dn,
+                        UserPrincipalName = string.IsNullOrWhiteSpace(upn) ? _rosterOrder[i].UserPrincipalName : upn.Trim()
+                    };
+                }
+            }
+
+            await PublishRosterAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Graph enrichment failed for {UserId}.", azureUserId);
+        }
     }
 
     private void RemoveParticipant(IParticipant participant)
     {
-        var id = participant.Resource?.Id;
-        if (string.IsNullOrWhiteSpace(id))
+        var callPartId = participant.Resource?.Id;
+        if (string.IsNullOrWhiteSpace(callPartId))
         {
             return;
         }
 
         lock (_lock)
         {
-            _idToDisplayName.Remove(id);
-            _rosterOrder.RemoveAll(e => string.Equals(e.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (!_callParticipantIdToAzureUserId.ContainsKey(callPartId))
+            {
+                return;
+            }
+
+            _callParticipantIdToAzureUserId.Remove(callPartId);
+            _rosterOrder.RemoveAll(e => string.Equals(e.CallParticipantId, callPartId, StringComparison.OrdinalIgnoreCase));
         }
 
         _ = PublishRosterAsync();
@@ -157,14 +228,19 @@ public sealed class MeetingParticipantService
 
     private async Task PublishRosterAsync()
     {
-        List<RosterEntry> snapshot;
+        List<RosterParticipantDto> snapshot;
         lock (_lock)
         {
-            snapshot = _rosterOrder.ToList();
+            snapshot = _rosterOrder
+                .Select(e => new RosterParticipantDto(
+                    e.CallParticipantId,
+                    e.DisplayName,
+                    e.AzureAdObjectId,
+                    e.UserPrincipalName))
+                .ToList();
         }
 
-        await _broadcaster.BroadcastRosterAsync(
-            snapshot.Select(e => (e.Id, e.DisplayName)).ToList());
+        await _broadcaster.BroadcastRosterAsync(snapshot).ConfigureAwait(false);
     }
 
     private static bool IsOurBot(Participant resource, string botClientId)
@@ -174,26 +250,17 @@ public sealed class MeetingParticipantService
                string.Equals(appId.Trim(), botClientId.Trim(), StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string? ResolveDisplayName(Participant resource)
-    {
-        var identity = resource.Info?.Identity;
-        if (identity is null)
-        {
-            return null;
-        }
-
-        if (!string.IsNullOrWhiteSpace(identity.User?.DisplayName))
-        {
-            return identity.User!.DisplayName;
-        }
-
-        if (!string.IsNullOrWhiteSpace(identity.User?.Id))
-        {
-            return identity.User!.Id;
-        }
-
-        return null;
-    }
-
-    private readonly record struct RosterEntry(string Id, string DisplayName);
+    private readonly record struct RosterEntry(
+        string CallParticipantId,
+        string AzureAdObjectId,
+        string DisplayName,
+        string? UserPrincipalName);
 }
+
+public readonly record struct SpeakerResolution(string DisplayName, string? UserPrincipalName, string? AzureAdObjectId);
+
+public sealed record RosterParticipantDto(
+    string CallParticipantId,
+    string DisplayName,
+    string AzureAdObjectId,
+    string? UserPrincipalName);

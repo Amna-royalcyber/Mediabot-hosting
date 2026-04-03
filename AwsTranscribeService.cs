@@ -16,6 +16,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private readonly ILogger<AwsTranscribeService> _logger;
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
     private readonly MeetingParticipantService _meetingParticipants;
+    private readonly bool _broadcastPartials;
     private readonly ConcurrentQueue<byte[]> _audioQueue = new();
     private readonly SemaphoreSlim _audioSignal = new(0);
     private readonly CancellationTokenSource _cts = new();
@@ -41,6 +42,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         _logger = logger;
         _transcriptBroadcaster = transcriptBroadcaster;
         _meetingParticipants = meetingParticipants;
+        _broadcastPartials = settings.TranscriptBroadcastPartials;
         var regionName = !string.IsNullOrWhiteSpace(settings.AwsRegion)
             ? settings.AwsRegion
             : (Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1");
@@ -131,6 +133,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             };
 
             // Some SDK builds deliver transcripts only on TranscriptEventReceived; others on EventReceived.
+            // Do not also handle TranscriptEvent on EventReceived — the SDK raises both for the same payload (duplicate UI lines).
             stream.TranscriptEventReceived += (_, e) =>
             {
                 try
@@ -150,12 +153,12 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             {
                 try
                 {
-                    // Fallback: some runtimes surface TranscriptEvent only here (subscribe both; duplicates possible).
-                    if (e.EventStreamEvent is TranscriptEvent te)
+                    if (e.EventStreamEvent is TranscriptEvent)
                     {
-                        HandleTranscriptResult(te, "EventReceived");
+                        return;
                     }
-                    else if (Interlocked.Decrement(ref _eventReceivedLogBudget) >= 0)
+
+                    if (Interlocked.Decrement(ref _eventReceivedLogBudget) >= 0)
                     {
                         _logger.LogInformation(
                             "Transcribe EventReceived (non-transcript): {Type}",
@@ -290,8 +293,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
             anyText = true;
             var awsSpeakerId = TryGetAwsSpeakerId(alt);
-            var teamsName = _meetingParticipants.TryResolveTeamsDisplayName(awsSpeakerId);
-            var speakerLabel = teamsName ?? FormatAwsSpeakerFallback(awsSpeakerId);
+            var speaker = _meetingParticipants.TryResolveSpeaker(awsSpeakerId);
+            var speakerLabel = BuildSpeakerLabel(speaker, awsSpeakerId);
 
             var kind = result.IsPartial == true ? "Partial" : "Final";
             if (kind == "Final")
@@ -311,7 +314,18 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 }
             }
 
-            _ = _transcriptBroadcaster.BroadcastAsync(kind, text, awsSpeakerId, speakerLabel);
+            if (kind == "Partial" && !_broadcastPartials)
+            {
+                continue;
+            }
+
+            _ = _transcriptBroadcaster.BroadcastAsync(
+                kind,
+                text,
+                awsSpeakerId,
+                speakerLabel,
+                speaker?.UserPrincipalName,
+                speaker?.AzureAdObjectId);
         }
 
         if (!anyText && transcriptEvent.Transcript.Results.Count > 0)
@@ -343,6 +357,29 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         }
 
         return null;
+    }
+
+    private static string BuildSpeakerLabel(SpeakerResolution? speaker, string? awsSpeakerId)
+    {
+        if (speaker is { } s)
+        {
+            if (!string.IsNullOrWhiteSpace(s.DisplayName) && !string.IsNullOrWhiteSpace(s.UserPrincipalName))
+            {
+                return $"{s.DisplayName} ({s.UserPrincipalName})";
+            }
+
+            if (!string.IsNullOrWhiteSpace(s.DisplayName))
+            {
+                return s.DisplayName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(s.AzureAdObjectId))
+            {
+                return s.AzureAdObjectId;
+            }
+        }
+
+        return FormatAwsSpeakerFallback(awsSpeakerId);
     }
 
     /// <summary>Human-readable when Teams roster mapping is not available (spk_0 → Speaker 1).</summary>
