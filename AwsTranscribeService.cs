@@ -11,7 +11,7 @@ namespace TeamsMediaBot;
 
 public sealed class AwsTranscribeService : IAsyncDisposable
 {
-    private static readonly Regex AwsSpeakerToken = new(@"spk_(\d+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex AwsSpeakerDigits = new(@"^(?:spk_)?(\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly ILogger<AwsTranscribeService> _logger;
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
@@ -292,7 +292,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             }
 
             anyText = true;
-            var awsSpeakerId = TryGetAwsSpeakerId(alt);
+            var awsSpeakerId = NormalizeAwsSpeakerId(TryGetAwsSpeakerId(alt));
             var speaker = _meetingParticipants.TryResolveSpeaker(awsSpeakerId);
             var speakerLabel = BuildSpeakerLabel(speaker, awsSpeakerId);
 
@@ -359,6 +359,23 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         return null;
     }
 
+    /// <summary>AWS sometimes returns <c>0</c> / <c>1</c>; we normalize to <c>spk_0</c> so roster index mapping matches.</summary>
+    private static string? NormalizeAwsSpeakerId(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        raw = raw.Trim();
+        if (raw.Length > 0 && raw.All(char.IsDigit))
+        {
+            return $"spk_{raw}";
+        }
+
+        return raw;
+    }
+
     private static string BuildSpeakerLabel(SpeakerResolution? speaker, string? awsSpeakerId)
     {
         if (speaker is { } s)
@@ -390,8 +407,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             return "Speaker";
         }
 
-        var m = AwsSpeakerToken.Match(awsSpeakerId);
-        if (m.Success && int.TryParse(m.Groups[1].Value, out var n))
+        var m = AwsSpeakerDigits.Match(awsSpeakerId.Trim());
+        if (m.Success && int.TryParse(m.Groups[1].Value, out var n) && n >= 0)
         {
             return $"Speaker {n + 1}";
         }

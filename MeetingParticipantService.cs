@@ -13,7 +13,8 @@ namespace TeamsMediaBot;
 /// </summary>
 public sealed class MeetingParticipantService
 {
-    private static readonly Regex AwsSpeakerIndex = new(@"^spk_(\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    /// <summary>AWS may send <c>spk_0</c> or a bare digit <c>0</c> depending on SDK/version.</summary>
+    private static readonly Regex AwsSpeakerIndex = new(@"^(?:spk_)?(\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly EntraUserResolver _entra;

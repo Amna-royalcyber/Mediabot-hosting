@@ -47,12 +47,20 @@
       .withAutomaticReconnect()
       .build();
 
+    let lastRosterByAad = {};
+
     connection.on("roster", (payload) => {
+      lastRosterByAad = {};
       const list = payload.participants || [];
       if (list.length === 0) {
         rosterEl.hidden = true;
         rosterEl.textContent = "";
         return;
+      }
+      for (const p of list) {
+        if (p.azureAdObjectId) {
+          lastRosterByAad[p.azureAdObjectId] = p.displayName || p.userPrincipalName || p.id;
+        }
       }
       rosterEl.hidden = false;
       rosterEl.innerHTML = "<strong>In this meeting (Microsoft Entra)</strong> " +
@@ -67,13 +75,22 @@
     connection.on("transcript", (message) => {
       const line = document.createElement("div");
       line.className = `line ${message.kind === "Final" ? "final" : "partial"}`;
-      const who = message.speakerLabel
-        ? `<span class="speaker">${escapeHtml(message.speakerLabel)}</span>`
+      let label = message.speakerLabel != null && String(message.speakerLabel).trim() !== ""
+        ? String(message.speakerLabel).trim()
+        : "";
+      if (label === "0") {
+        label = "";
+      }
+      if (!label && message.azureAdObjectId && lastRosterByAad[message.azureAdObjectId]) {
+        label = lastRosterByAad[message.azureAdObjectId];
+      }
+      const who = label
+        ? `<span class="speaker">${escapeHtml(label)}</span>`
         : "";
       const oid = message.azureAdObjectId
         ? ` <span class="aad-id" title="Azure AD object ID">${escapeHtml(message.azureAdObjectId)}</span>`
         : "";
-      line.innerHTML = `${who}[${message.kind}] ${escapeHtml(message.text || "")}${oid}`;
+      line.innerHTML = `${who}${escapeHtml(message.text || "")}${oid}`;
       transcriptsEl.prepend(line);
     });
 
