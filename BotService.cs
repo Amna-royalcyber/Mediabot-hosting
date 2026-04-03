@@ -31,6 +31,9 @@ public sealed class BotSettings
 
     /// <summary>Optional; defaults to host from Bot callback URL.</summary>
     public string? MediaServiceFqdn { get; init; }
+
+    /// <summary>Optional. Sets <see cref="JoinMeetingParameters.Subject"/> so the participant can show a clearer name in the roster (Azure Bot display name is also used by Teams).</summary>
+    public string? JoinMeetingSubject { get; init; }
 }
 
 public sealed class BotService

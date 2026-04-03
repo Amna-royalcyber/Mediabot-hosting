@@ -117,6 +117,11 @@ public sealed class CallHandler
             TenantId = joinTenantId,
         };
 
+        if (!string.IsNullOrWhiteSpace(_settings.JoinMeetingSubject))
+        {
+            joinParams.Subject = _settings.JoinMeetingSubject.Trim();
+        }
+
         ICall call;
         try
         {

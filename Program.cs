@@ -34,7 +34,8 @@ public static class Program
             MediaPublicIp = GetConfig(builder.Configuration, "BOT_MEDIA_PUBLIC_IP", "Media:PublicIp"),
             MediaInstanceInternalPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_INTERNAL_PORT", "Media:InstanceInternalPort", 8445),
             MediaInstancePublicPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_PUBLIC_PORT", "Media:InstancePublicPort", 8445),
-            MediaServiceFqdn = ReadOptional(builder.Configuration, "BOT_MEDIA_SERVICE_FQDN", "Media:ServiceFqdn")
+            MediaServiceFqdn = ReadOptional(builder.Configuration, "BOT_MEDIA_SERVICE_FQDN", "Media:ServiceFqdn"),
+            JoinMeetingSubject = ReadOptional(builder.Configuration, "BOT_JOIN_MEETING_SUBJECT", "Bot:JoinMeetingSubject")
         });
 
         builder.Services.AddSingleton<TranscriptBroadcaster>();
