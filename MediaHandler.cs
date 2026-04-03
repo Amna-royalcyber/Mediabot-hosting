@@ -12,6 +12,7 @@ public sealed class MediaHandler
     private readonly AudioProcessor _audioProcessor;
     private readonly AwsTranscribeService _awsTranscribeService;
     private IAudioSocket? _audioSocket;
+    private bool _loggedFirstAudioFrame;
 
     public MediaHandler(
         ILogger<MediaHandler> logger,
@@ -40,6 +41,7 @@ public sealed class MediaHandler
 
         _audioSocket = mediaSession.AudioSocket;
         _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
+        _loggedFirstAudioFrame = false;
 
         _logger.LogInformation("Media session initialized and audio event subscribed.");
         return mediaSession;
@@ -56,6 +58,14 @@ public sealed class MediaHandler
         byte[] pcmChunk = _audioProcessor.ConvertToPcm(incomingFrame);
         _audioProcessor.BufferChunk(pcmChunk);
         _awsTranscribeService.SendAudioChunk(pcmChunk);
+
+        if (!_loggedFirstAudioFrame && pcmChunk.Length > 0)
+        {
+            _loggedFirstAudioFrame = true;
+            _logger.LogInformation(
+                "First PCM chunk from Teams to Transcribe (length={Length} bytes). Speak in the meeting to drive transcription.",
+                pcmChunk.Length);
+        }
 
         _logger.LogDebug(
             "Audio frame received and buffered. Timestamp: {Timestamp}, Length: {Length}",

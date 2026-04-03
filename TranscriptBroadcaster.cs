@@ -1,23 +1,33 @@
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 
 namespace TeamsMediaBot;
 
 public sealed class TranscriptBroadcaster
 {
     private readonly IHubContext<TranscriptHub> _hubContext;
+    private readonly ILogger<TranscriptBroadcaster> _logger;
 
-    public TranscriptBroadcaster(IHubContext<TranscriptHub> hubContext)
+    public TranscriptBroadcaster(IHubContext<TranscriptHub> hubContext, ILogger<TranscriptBroadcaster> logger)
     {
         _hubContext = hubContext;
+        _logger = logger;
     }
 
-    public Task BroadcastAsync(string kind, string text)
+    public async Task BroadcastAsync(string kind, string text)
     {
-        return _hubContext.Clients.All.SendAsync("transcript", new
+        try
         {
-            kind,
-            text,
-            timestamp = DateTimeOffset.UtcNow
-        });
+            await _hubContext.Clients.All.SendAsync("transcript", new
+            {
+                kind,
+                text,
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR broadcast failed for transcript kind={Kind}.", kind);
+        }
     }
 }

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading;
 using Amazon;
 using Amazon.TranscribeStreaming;
 using Amazon.TranscribeStreaming.Model;
@@ -18,6 +19,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private Task? _streamingTask;
     private TaskCompletionSource<bool>? _sessionReady;
     private StartStreamTranscriptionResponse? _activeResponse;
+    private int _eventReceivedLogBudget = 40;
 
     public AwsTranscribeService(
         ILogger<AwsTranscribeService> logger,
@@ -50,6 +52,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             LanguageCode = LanguageCode.EnUS,
             MediaEncoding = MediaEncoding.Pcm,
             MediaSampleRateHertz = 16000,
+            EnablePartialResultsStabilization = true,
+            PartialResultsStability = PartialResultsStability.Medium,
             AudioStreamPublisher = GetNextAudioEventAsync
         };
 
@@ -79,6 +83,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
             _activeResponse = await _client.StartStreamTranscriptionAsync(request, linkedCts.Token);
 
+            Interlocked.Exchange(ref _eventReceivedLogBudget, 40);
+
             var stream = _activeResponse.TranscriptResultStream;
             stream.ExceptionReceived += (_, e) =>
             {
@@ -90,24 +96,26 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 _logger.LogInformation("AWS Transcribe initial response received (session active).");
             };
 
-            stream.TranscriptEventReceived += (_, e) =>
+            // Prefer EventReceived: covers all event types; some SDK paths only surface TranscriptEvent here.
+            stream.EventReceived += (_, e) =>
             {
                 try
                 {
+                    if (Interlocked.Decrement(ref _eventReceivedLogBudget) >= 0)
+                    {
+                        _logger.LogInformation(
+                            "Transcribe EventReceived: {Type}",
+                            e.EventStreamEvent?.GetType().FullName ?? "(null)");
+                    }
+
                     if (e.EventStreamEvent is TranscriptEvent te)
                     {
                         HandleTranscriptResult(te);
                     }
-                    else
-                    {
-                        _logger.LogDebug(
-                            "Transcript stream event type: {Type}",
-                            e.EventStreamEvent?.GetType().FullName ?? "(null)");
-                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error handling TranscriptEvent");
+                    _logger.LogError(ex, "Error handling Transcribe EventReceived");
                 }
             };
 
