@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Threading;
 using Amazon;
 using Amazon.TranscribeStreaming;
@@ -21,8 +22,10 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private StartStreamTranscriptionResponse? _activeResponse;
     private int _eventReceivedLogBudget = 40;
     private long _chunksPublishedToSdk;
+    private long _chunksEnqueuedFromTeams;
     private int _transcriptEventCount;
     private int _emptyTranscriptStreak;
+    private int _partialLogCounter;
 
     public AwsTranscribeService(
         ILogger<AwsTranscribeService> logger,
@@ -35,6 +38,13 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             ? settings.AwsRegion
             : (Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1");
         _logger.LogInformation("AWS Transcribe Streaming client region: {Region}", regionName);
+        _logger.LogInformation(
+            "AWS credential hints: AWS_ACCESS_KEY_ID set={HasKey}, AWS_PROFILE={Profile}, AWS_SHARED_CREDENTIALS_FILE={CredsFile}",
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AWS_ACCESS_KEY_ID")),
+            Environment.GetEnvironmentVariable("AWS_PROFILE") ?? "(default)",
+            Environment.GetEnvironmentVariable("AWS_SHARED_CREDENTIALS_FILE") ?? "(default path)");
+
+        // Default client uses the same credential chain as AWS CLI (env, shared file, instance profile).
         _client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(regionName));
     }
 
@@ -45,6 +55,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     {
         if (_streamingTask is not null)
         {
+            _logger.LogWarning(
+                "StartStreamingAsync skipped: a Transcribe session already exists for this process. Audio still enqueues to the same stream; for a fresh AWS session restart the bot.");
             return;
         }
 
@@ -88,10 +100,14 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
             Interlocked.Exchange(ref _eventReceivedLogBudget, 40);
             Interlocked.Exchange(ref _chunksPublishedToSdk, 0);
+            Interlocked.Exchange(ref _chunksEnqueuedFromTeams, 0);
             Interlocked.Exchange(ref _transcriptEventCount, 0);
             Interlocked.Exchange(ref _emptyTranscriptStreak, 0);
+            Interlocked.Exchange(ref _partialLogCounter, 0);
 
             var stream = _activeResponse.TranscriptResultStream;
+
+            // Wire handlers synchronously immediately after the call returns (before any other await in this method).
             stream.ExceptionReceived += (_, e) =>
             {
                 _logger.LogError(e.EventStreamException, "AWS Transcribe stream exception");
@@ -102,23 +118,30 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 _logger.LogInformation("AWS Transcribe initial response received (session active).");
             };
 
-            // Prefer EventReceived: covers all event types; some SDK paths only surface TranscriptEvent here.
-            stream.EventReceived += (_, e) =>
+            // Some SDK builds deliver transcripts only on TranscriptEventReceived; others on EventReceived.
+            stream.TranscriptEventReceived += (_, e) =>
             {
                 try
                 {
                     if (e.EventStreamEvent is TranscriptEvent te)
                     {
-                        var c = Interlocked.Increment(ref _transcriptEventCount);
-                        if (c == 1 || c % 25 == 0)
-                        {
-                            _logger.LogInformation(
-                                "Transcribe TranscriptEvent #{Ordinal}: {ResultCount} result(s).",
-                                c,
-                                te.Transcript?.Results?.Count ?? 0);
-                        }
+                        HandleTranscriptResult(te, "TranscriptEventReceived");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error handling Transcribe TranscriptEventReceived");
+                }
+            };
 
-                        HandleTranscriptResult(te);
+            stream.EventReceived += (_, e) =>
+            {
+                try
+                {
+                    // Fallback: some runtimes surface TranscriptEvent only here (subscribe both; duplicates possible).
+                    if (e.EventStreamEvent is TranscriptEvent te)
+                    {
+                        HandleTranscriptResult(te, "EventReceived");
                     }
                     else if (Interlocked.Decrement(ref _eventReceivedLogBudget) >= 0)
                     {
@@ -132,6 +155,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                     _logger.LogError(ex, "Error handling Transcribe EventReceived");
                 }
             };
+
+            LogTranscriptStreamDiagnostics(stream);
 
             sessionReady.TrySetResult(true);
 
@@ -159,16 +184,36 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             return;
         }
 
+        var enq = Interlocked.Increment(ref _chunksEnqueuedFromTeams);
+        if (enq % 1000 == 0)
+        {
+            var pub = Interlocked.Read(ref _chunksPublishedToSdk);
+            _logger.LogInformation(
+                "Transcribe queue: {Enqueued} chunks enqueued from Teams, {Published} chunks published to AWS SDK (gap indicates publisher backlog).",
+                enq,
+                pub);
+        }
+
         _audioQueue.Enqueue(data);
         _audioSignal.Release();
     }
 
-    public void HandleTranscriptResult(TranscriptEvent transcriptEvent)
+    public void HandleTranscriptResult(TranscriptEvent transcriptEvent, string source = "")
     {
         if (transcriptEvent.Transcript?.Results is null)
         {
             _logger.LogDebug("TranscriptEvent had null Transcript.Results.");
             return;
+        }
+
+        var c = Interlocked.Increment(ref _transcriptEventCount);
+        if (c == 1 || c % 25 == 0)
+        {
+            _logger.LogInformation(
+                "Transcribe TranscriptEvent ({Source}) #{Ordinal}: {ResultCount} result(s).",
+                string.IsNullOrEmpty(source) ? "handler" : source,
+                c,
+                transcriptEvent.Transcript.Results.Count);
         }
 
         var anyText = false;
@@ -193,7 +238,15 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             }
             else
             {
-                _logger.LogDebug("Transcribe partial: {Text}", text);
+                var p = Interlocked.Increment(ref _partialLogCounter);
+                if (p <= 5 || p % 30 == 0)
+                {
+                    _logger.LogInformation("Transcribe partial: {Text}", text);
+                }
+                else
+                {
+                    _logger.LogDebug("Transcribe partial: {Text}", text);
+                }
             }
 
             _ = _transcriptBroadcaster.BroadcastAsync(kind, text);
@@ -239,6 +292,25 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         }
 
         throw new OperationCanceledException(_cts.Token);
+    }
+
+    private void LogTranscriptStreamDiagnostics(TranscriptResultStream stream)
+    {
+        try
+        {
+            var t = stream.GetType();
+            var isProcessing = t.GetProperty("IsProcessing", BindingFlags.Public | BindingFlags.Instance);
+            if (isProcessing is not null)
+            {
+                _logger.LogInformation(
+                    "TranscriptResultStream.IsProcessing = {IsProcessing} (response reader should be active).",
+                    isProcessing.GetValue(stream));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not read TranscriptResultStream diagnostic properties.");
+        }
     }
 
     public async ValueTask DisposeAsync()

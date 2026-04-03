@@ -53,14 +53,31 @@ public sealed class MediaHandler
 
     private void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs args)
     {
+        int declaredLength = (int)args.Buffer.Length;
+        byte[] extracted = AudioProcessor.ExtractBytes(args.Buffer);
+        if (declaredLength > 0 && extracted.Length == 0)
+        {
+            _logger.LogError(
+                "AudioMediaReceived: buffer Length={DeclaredLen} but ExtractBytes returned 0 bytes (reflection path may not match buffer type).",
+                declaredLength);
+        }
+
         var incomingFrame = new AudioFrame(
-            Data: AudioProcessor.ExtractBytes(args.Buffer),
+            Data: extracted,
             Timestamp: args.Buffer.Timestamp,
-            Length: (int)args.Buffer.Length,
+            Length: declaredLength,
             Format: AudioFormat.Pcm16K);
 
         byte[] pcmChunk = _audioProcessor.ConvertToPcm(incomingFrame);
-        _audioProcessor.BufferChunk(pcmChunk);
+        if (incomingFrame.Length > 0 && pcmChunk.Length == 0)
+        {
+            _logger.LogError(
+                "AudioMediaReceived: non-zero frame length ({FrameLen}) produced empty PCM after ConvertToPcm (format {Format}).",
+                incomingFrame.Length,
+                incomingFrame.Format);
+        }
+
+        // AWS Transcribe path uses AwsTranscribeService only. Do not enqueue to AudioProcessor.BufferChunk — nothing consumes it (memory leak on long calls).
         _awsTranscribeService.SendAudioChunk(pcmChunk);
 
         if (pcmChunk.Length > 0)
