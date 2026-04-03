@@ -13,12 +13,14 @@ namespace TeamsMediaBot;
 public sealed class CallHandler
 {
     private readonly BotSettings _settings;
+    private readonly MeetingParticipantService _meetingParticipants;
     private readonly ILogger<CallHandler> _logger;
     private ICommunicationsClient? _communicationsClient;
 
-    public CallHandler(BotSettings settings, ILogger<CallHandler> logger)
+    public CallHandler(BotSettings settings, MeetingParticipantService meetingParticipants, ILogger<CallHandler> logger)
     {
         _settings = settings;
+        _meetingParticipants = meetingParticipants;
         _logger = logger;
     }
 
@@ -169,6 +171,8 @@ public sealed class CallHandler
                     "Call established. MediaHandler will log PCM when mixed audio is available (unmute participants and speak — silence may produce few or no frames).");
             }
         };
+
+        _meetingParticipants.AttachToCall(call, _settings.ClientId);
 
         _logger.LogInformation("Join request submitted. Call ID: {CallId}, ScenarioId={ScenarioId}", call.Id, scenarioId);
         return call;

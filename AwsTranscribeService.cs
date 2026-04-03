@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Amazon;
 using Amazon.TranscribeStreaming;
@@ -10,8 +11,11 @@ namespace TeamsMediaBot;
 
 public sealed class AwsTranscribeService : IAsyncDisposable
 {
+    private static readonly Regex AwsSpeakerToken = new(@"spk_(\d+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
     private readonly ILogger<AwsTranscribeService> _logger;
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
+    private readonly MeetingParticipantService _meetingParticipants;
     private readonly ConcurrentQueue<byte[]> _audioQueue = new();
     private readonly SemaphoreSlim _audioSignal = new(0);
     private readonly CancellationTokenSource _cts = new();
@@ -31,10 +35,12 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     public AwsTranscribeService(
         ILogger<AwsTranscribeService> logger,
         TranscriptBroadcaster transcriptBroadcaster,
+        MeetingParticipantService meetingParticipants,
         BotSettings settings)
     {
         _logger = logger;
         _transcriptBroadcaster = transcriptBroadcaster;
+        _meetingParticipants = meetingParticipants;
         var regionName = !string.IsNullOrWhiteSpace(settings.AwsRegion)
             ? settings.AwsRegion
             : (Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1");
@@ -68,6 +74,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             LanguageCode = LanguageCode.EnUS,
             MediaEncoding = MediaEncoding.Pcm,
             MediaSampleRateHertz = 16000,
+            ShowSpeakerLabel = true,
             EnablePartialResultsStabilization = true,
             PartialResultsStability = PartialResultsStability.Medium,
             AudioStreamPublisher = GetNextAudioEventAsync
@@ -274,32 +281,37 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 continue;
             }
 
-            string text = result.Alternatives[0].Transcript ?? string.Empty;
+            var alt = result.Alternatives[0];
+            string text = alt.Transcript ?? string.Empty;
             if (string.IsNullOrWhiteSpace(text))
             {
                 continue;
             }
 
             anyText = true;
+            var awsSpeakerId = TryGetAwsSpeakerId(alt);
+            var teamsName = _meetingParticipants.TryResolveTeamsDisplayName(awsSpeakerId);
+            var speakerLabel = teamsName ?? FormatAwsSpeakerFallback(awsSpeakerId);
+
             var kind = result.IsPartial == true ? "Partial" : "Final";
             if (kind == "Final")
             {
-                _logger.LogInformation("Transcribe final: {Text}", text);
+                _logger.LogInformation("Transcribe final ({Speaker}): {Text}", speakerLabel, text);
             }
             else
             {
                 var p = Interlocked.Increment(ref _partialLogCounter);
                 if (p <= 5 || p % 30 == 0)
                 {
-                    _logger.LogInformation("Transcribe partial: {Text}", text);
+                    _logger.LogInformation("Transcribe partial ({Speaker}): {Text}", speakerLabel, text);
                 }
                 else
                 {
-                    _logger.LogDebug("Transcribe partial: {Text}", text);
+                    _logger.LogDebug("Transcribe partial ({Speaker}): {Text}", speakerLabel, text);
                 }
             }
 
-            _ = _transcriptBroadcaster.BroadcastAsync(kind, text);
+            _ = _transcriptBroadcaster.BroadcastAsync(kind, text, awsSpeakerId, speakerLabel);
         }
 
         if (!anyText && transcriptEvent.Transcript.Results.Count > 0)
@@ -313,6 +325,41 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                     n);
             }
         }
+    }
+
+    private static string? TryGetAwsSpeakerId(Alternative alt)
+    {
+        if (alt.Items is null || alt.Items.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var item in alt.Items)
+        {
+            if (!string.IsNullOrEmpty(item.Speaker))
+            {
+                return item.Speaker;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>Human-readable when Teams roster mapping is not available (spk_0 → Speaker 1).</summary>
+    private static string FormatAwsSpeakerFallback(string? awsSpeakerId)
+    {
+        if (string.IsNullOrEmpty(awsSpeakerId))
+        {
+            return "Speaker";
+        }
+
+        var m = AwsSpeakerToken.Match(awsSpeakerId);
+        if (m.Success && int.TryParse(m.Groups[1].Value, out var n))
+        {
+            return $"Speaker {n + 1}";
+        }
+
+        return awsSpeakerId;
     }
 
     /// <summary>

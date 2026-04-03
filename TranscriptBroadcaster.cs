@@ -14,7 +14,11 @@ public sealed class TranscriptBroadcaster
         _logger = logger;
     }
 
-    public async Task BroadcastAsync(string kind, string text)
+    public async Task BroadcastAsync(
+        string kind,
+        string text,
+        string? awsSpeakerId = null,
+        string? speakerLabel = null)
     {
         try
         {
@@ -22,12 +26,30 @@ public sealed class TranscriptBroadcaster
             {
                 kind,
                 text,
+                awsSpeakerId,
+                speakerLabel,
                 timestamp = DateTimeOffset.UtcNow
             });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "SignalR broadcast failed for transcript kind={Kind}.", kind);
+        }
+    }
+
+    public async Task BroadcastRosterAsync(IReadOnlyList<(string Id, string DisplayName)> participants)
+    {
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("roster", new
+            {
+                participants = participants.Select(p => new { id = p.Id, displayName = p.DisplayName }).ToList(),
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR roster broadcast failed.");
         }
     }
 }

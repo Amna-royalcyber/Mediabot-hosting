@@ -55,6 +55,7 @@ public static class Program
         });
 
         builder.Services.AddSingleton<TranscriptBroadcaster>();
+        builder.Services.AddSingleton<MeetingParticipantService>();
         builder.Services.AddSingleton<AudioProcessor>();
         builder.Services.AddSingleton<AwsTranscribeService>();
         builder.Services.AddSingleton<MediaHandler>();
