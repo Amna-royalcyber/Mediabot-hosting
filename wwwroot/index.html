@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Teams Bot Transcription</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
+    h1 { margin-bottom: 8px; }
+    .row { display: flex; gap: 8px; margin-bottom: 12px; }
+    input { flex: 1; padding: 10px; }
+    button { padding: 10px 14px; cursor: pointer; }
+    #status { margin: 10px 0; color: #1f4f8f; }
+    #transcripts { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 260px; }
+    .line { margin: 6px 0; }
+    .partial { color: #666; }
+    .final { color: #111; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Teams Bot Live Transcription</h1>
+  <p>Enter a Teams meeting join URL, then click Join Call.</p>
+
+  <div class="row">
+    <input id="meetingUrl" type="text" placeholder="https://teams.microsoft.com/l/meetup-join/..." />
+    <button id="joinBtn">Join Call</button>
+  </div>
+
+  <div id="status">Connecting to transcript stream...</div>
+  <div id="transcripts"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.7/signalr.min.js"></script>
+  <script>
+    const statusEl = document.getElementById("status");
+    const transcriptsEl = document.getElementById("transcripts");
+    const meetingUrlEl = document.getElementById("meetingUrl");
+    const joinBtn = document.getElementById("joinBtn");
+
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("/hubs/transcripts")
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on("transcript", (message) => {
+      const line = document.createElement("div");
+      line.className = `line ${message.kind === "Final" ? "final" : "partial"}`;
+      line.textContent = `[${message.kind}] ${message.text}`;
+      transcriptsEl.prepend(line);
+    });
+
+    async function startHub() {
+      try {
+        await connection.start();
+        statusEl.textContent = "Connected. Ready to join meeting.";
+      } catch (err) {
+        statusEl.textContent = "SignalR connection failed. Retrying...";
+        setTimeout(startHub, 2000);
+      }
+    }
+
+    joinBtn.addEventListener("click", async () => {
+      const meetingJoinUrl = meetingUrlEl.value.trim();
+      if (!meetingJoinUrl) {
+        statusEl.textContent = "Please enter a meeting join URL.";
+        return;
+      }
+
+      statusEl.textContent = "Submitting join request...";
+      try {
+        const response = await fetch("/api/bot/join", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ meetingJoinUrl })
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          statusEl.textContent = `Join failed: ${error}`;
+          return;
+        }
+
+        statusEl.textContent = "Join request submitted. Waiting for live transcripts...";
+      } catch (err) {
+        statusEl.textContent = "Join request failed.";
+      }
+    });
+
+    startHub();
+  </script>
+</body>
+</html>
