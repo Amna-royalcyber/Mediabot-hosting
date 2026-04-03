@@ -36,6 +36,14 @@ public sealed class BotSettings
     /// <summary>Optional; defaults to host from Bot callback URL.</summary>
     public string? MediaServiceFqdn { get; init; }
 
+    /// <summary>
+    /// Optional UDP port range for RTP (Skype <see cref="PortRange"/>). If unset, the SDK defaults to a large range (often 49152–65279), which many clouds block.
+    /// Set both min and max to a narrow range (e.g. 41000–41999) and open the same range inbound in your cloud NSG and Windows Firewall.
+    /// </summary>
+    public uint? MediaUdpPortMin { get; init; }
+
+    public uint? MediaUdpPortMax { get; init; }
+
     /// <summary>Optional. Sets <see cref="JoinMeetingParameters.Subject"/> so the participant can show a clearer name in the roster (Azure Bot display name is also used by Teams).</summary>
     public string? JoinMeetingSubject { get; init; }
 }
@@ -169,10 +177,20 @@ public sealed class BotService
             ? notificationUri.Host
             : _settings.MediaServiceFqdn.Trim();
 
-        _logger.LogInformation(
-            "Media Platform ServiceFqdn={MediaFqdn} (must match the TLS cert CN/SAN on this VM). Callback host={CallbackHost}. If these differ, set Media:ServiceFqdn or BOT_MEDIA_SERVICE_FQDN to the cert name.",
-            fqdn,
-            notificationUri.Host);
+        if (!string.Equals(notificationUri.Host, fqdn, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning(
+                "Callback host ({CallbackHost}) and Media ServiceFqdn ({MediaFqdn}) differ. They should match your TLS cert CN/SAN. " +
+                "BOT_SERVICE_BASE_URL overrides Bot:CallbackUrl — set it to https://<cert-hostname>/callback or remove it to use appsettings.",
+                notificationUri.Host,
+                fqdn);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Media Platform ServiceFqdn={MediaFqdn} (matches callback host; cert must cover this name).",
+                fqdn);
+        }
 
         if (!IPAddress.TryParse(_settings.MediaPublicIp.Trim(), out var publicIp))
         {
@@ -180,17 +198,21 @@ public sealed class BotService
                 "Media:PublicIp / BOT_MEDIA_PUBLIC_IP must be the VM public IPv4 address (e.g. 203.0.113.10).");
         }
 
+        var instanceSettings = new MediaPlatformInstanceSettings
+        {
+            CertificateThumbprint = _settings.MediaCertificateThumbprint.Trim(),
+            InstanceInternalPort = _settings.MediaInstanceInternalPort,
+            InstancePublicPort = _settings.MediaInstancePublicPort,
+            InstancePublicIPAddress = publicIp,
+            ServiceFqdn = fqdn
+        };
+
+        ApplyMediaUdpPortRange(instanceSettings, _settings, _logger);
+
         var mediaPlatformSettings = new MediaPlatformSettings
         {
             ApplicationId = _settings.ClientId,
-            MediaPlatformInstanceSettings = new MediaPlatformInstanceSettings
-            {
-                CertificateThumbprint = _settings.MediaCertificateThumbprint.Trim(),
-                InstanceInternalPort = _settings.MediaInstanceInternalPort,
-                InstancePublicPort = _settings.MediaInstancePublicPort,
-                InstancePublicIPAddress = publicIp,
-                ServiceFqdn = fqdn
-            }
+            MediaPlatformInstanceSettings = instanceSettings
         };
 
         TryApplyMediaHttpControlSettings(
@@ -208,6 +230,38 @@ public sealed class BotService
             .SetNotificationUrl(notificationUri)
             .SetMediaPlatformSettings(mediaPlatformSettings)
             .Build();
+    }
+
+    private static void ApplyMediaUdpPortRange(
+        MediaPlatformInstanceSettings instanceSettings,
+        BotSettings settings,
+        ILogger logger)
+    {
+        var min = settings.MediaUdpPortMin;
+        var max = settings.MediaUdpPortMax;
+        if (min is null && max is null)
+        {
+            logger.LogInformation(
+                "Media UDP port range not set; SDK default applies (typically 49152–65279). For cloud firewalls that disallow large ranges, set Media:UdpPortMin and Media:UdpPortMax to a narrow range.");
+            return;
+        }
+
+        if (min is null || max is null)
+        {
+            throw new InvalidOperationException(
+                "Set both Media:UdpPortMin and Media:UdpPortMax (and BOT_MEDIA_UDP_PORT_MIN / BOT_MEDIA_UDP_PORT_MAX), or omit both.");
+        }
+
+        if (min > max || max > 65535u)
+        {
+            throw new InvalidOperationException("Media:UdpPortMin must be <= Media:UdpPortMax, and max must be <= 65535.");
+        }
+
+        instanceSettings.MediaPortRange = new PortRange(min.Value, max.Value);
+        logger.LogInformation(
+            "Media UDP port range set to {Min}-{Max}. Open this UDP range inbound on your cloud NSG and Windows Firewall (plus TCP 8445 for media TLS).",
+            min,
+            max);
     }
 
     /// <summary>
