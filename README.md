@@ -98,12 +98,9 @@ Values are read from **environment variables first**, then **`appsettings.json`*
 | **`CallHandler.cs`** | Parses Teams **join URLs** (and optional **coordinates**), builds **`JoinMeetingParameters`**, calls **`Calls().AddAsync`**. Sets organizer **tenant** (`SetTenantId`) and **reply-chain** message id when present in URL context. |
 | **`MeetingJoinParser.cs`** | Extracts thread id / optional passcode from a URL for API responses and correlation. |
 | **`BotApiModels.cs`** | **`JoinMeetingRequest`** JSON model for join endpoints. |
-| **`MediaHandler.cs`** | Creates **app-hosted** **`IMediaSession`** with **unmixed meeting audio**; subscribes to **`AudioMediaReceived`** and routes per-source buffers to **`ParticipantAudioStreamHandler`**. |
-| **`ParticipantAudioStreamHandler.cs`** | Reads **`UnmixedAudioBuffers`**, converts to PCM, and calls **`TranscriptionManager.ProcessParticipantAudioAsync`** per **`ActiveSpeakerId`**. |
+| **`MediaHandler.cs`** | Creates **app-hosted** **`IMediaSession`** (PCM 16 kHz receive); subscribes to **`AudioMediaReceived`** and forwards audio downstream. |
 | **`AudioProcessor.cs`** | Converts/buffers raw audio frames for streaming. |
-| **`TranscriptionManager.cs`** | Maps **Graph participant `mediaStreams[].sourceId`** to **Entra user id + display name**; one **`TranscribeStreamService`** per source id; lifecycle on join/leave. |
-| **`TranscribeStreamService.cs`** | **Amazon Transcribe streaming** per participant (**`ShowSpeakerLabel = false`**); publishes **`TranscriptFragment`** with identity from Teams, not AWS labels. |
-| **`TranscriptAggregator.cs`** | Background merge/broadcast of fragments to SignalR with correct display names. |
+| **`AwsTranscribeService.cs`** | Starts **Amazon Transcribe streaming**; consumes PCM chunks; raises transcript events. |
 | **`TranscriptBroadcaster.cs`** | Sends transcript payloads to **SignalR** clients. |
 | **`TranscriptHub.cs`** | SignalR hub for `/hubs/transcripts`. |
 | **`appsettings.json`** | Default configuration (replace secrets via env in production). |
