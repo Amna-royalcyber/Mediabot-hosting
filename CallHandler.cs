@@ -174,7 +174,7 @@ public sealed class CallHandler
             if (r?.State?.ToString() == "Established")
             {
                 _logger.LogInformation(
-                    "Call established. MediaHandler will log PCM when mixed audio is available (unmute participants and speak — silence may produce few or no frames).");
+                    "Call established. MediaHandler is receiving unmixed participant audio; speaking participants should produce per-source audio frames.");
             }
         };
 

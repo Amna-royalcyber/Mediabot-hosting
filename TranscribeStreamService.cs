@@ -20,10 +20,13 @@ public sealed class TranscribeStreamService : IAsyncDisposable
     private readonly SemaphoreSlim _signal = new(0);
     private readonly CancellationTokenSource _cts = new();
     private readonly object _participantLock = new();
+    private readonly bool _broadcastPartials;
 
     private ParticipantIdentity _participant;
     private Task? _sessionTask;
     private string? _lastFinalTranscript;
+    private string? _lastPartialTranscript;
+    private DateTime _lastPartialSentAtUtc = DateTime.MinValue;
 
     public TranscribeStreamService(
         BotSettings settings,
@@ -34,6 +37,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         _aggregator = aggregator;
         _participant = participant;
         _logger = logger;
+        _broadcastPartials = settings.TranscriptBroadcastPartials;
         _client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(settings.AwsRegion));
     }
 
@@ -131,9 +135,33 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                 continue;
             }
 
-            // Avoid flooding downstream with partial stabilization updates.
             if (result.IsPartial == true)
             {
+                if (!_broadcastPartials)
+                {
+                    continue;
+                }
+
+                var now = DateTime.UtcNow;
+                if (string.Equals(_lastPartialTranscript, text, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                // Keep low latency while suppressing excessive UI churn.
+                if ((now - _lastPartialSentAtUtc).TotalMilliseconds < 250)
+                {
+                    continue;
+                }
+
+                _lastPartialTranscript = text;
+                _lastPartialSentAtUtc = now;
+                await _aggregator.PublishAsync(new TranscriptFragment(
+                    AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
+                    Kind: "Partial",
+                    Text: text,
+                    UserId: participant.UserId,
+                    DisplayName: participant.DisplayName));
                 continue;
             }
 

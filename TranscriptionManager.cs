@@ -58,15 +58,17 @@ public sealed class TranscriptionManager : IAsyncDisposable
             return;
         }
 
-        var participant = _participantBySourceId.TryGetValue(sourceId, out var mapped)
-            ? mapped
-            : new ParticipantIdentity($"source:{sourceId}", $"Speaker {sourceId}");
-
-        if (mapped is null && _unresolvedSourceIds.TryAdd(sourceId, 0))
+        if (!_participantBySourceId.TryGetValue(sourceId, out var participant))
         {
-            _logger.LogWarning(
-                "No participant mapping for sourceId {SourceId}. Waiting for roster mediaStreams source mapping.",
-                sourceId);
+            if (_unresolvedSourceIds.TryAdd(sourceId, 0))
+            {
+                _logger.LogWarning(
+                    "No participant mapping for sourceId {SourceId}. Audio will be ignored until mapped to an Entra user.",
+                    sourceId);
+            }
+
+            // Enforce identity correctness: never transcribe/emit for unmapped source ids.
+            return;
         }
 
         var stream = _streamsBySourceId.GetOrAdd(sourceId, _ =>
@@ -112,9 +114,10 @@ public sealed class TranscriptionManager : IAsyncDisposable
         if (sourceIds.Count == 0)
         {
             _logger.LogDebug(
-                "Participant {UserId} ({DisplayName}) has no sourceId in AdditionalData media streams yet.",
+                "Participant {UserId} ({DisplayName}) has no sourceId in media streams yet. AdditionalData: {AdditionalDataSummary}",
                 identityRecord.UserId,
-                identityRecord.DisplayName);
+                identityRecord.DisplayName,
+                DescribeAdditionalData(resource));
             return;
         }
 
@@ -218,6 +221,34 @@ public sealed class TranscriptionManager : IAsyncDisposable
         }
 
         return list;
+    }
+
+    private static string DescribeAdditionalData(Microsoft.Graph.Models.Participant? participant)
+    {
+        if (participant?.AdditionalData is null || participant.AdditionalData.Count == 0)
+        {
+            return "<empty>";
+        }
+
+        var keys = string.Join(",", participant.AdditionalData.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase));
+        if (!participant.AdditionalData.TryGetValue("mediaStreams", out var mediaStreams) &&
+            !participant.AdditionalData.TryGetValue("MediaStreams", out mediaStreams))
+        {
+            return $"keys=[{keys}]";
+        }
+
+        var mediaText = mediaStreams switch
+        {
+            JsonElement je => je.ToString(),
+            null => "<null>",
+            _ => mediaStreams.ToString() ?? "<unknown>"
+        };
+        if (mediaText.Length > 400)
+        {
+            mediaText = mediaText[..400] + "...";
+        }
+
+        return $"keys=[{keys}], mediaStreams={mediaText}";
     }
 
     private static bool TryParseFromJson(string json, List<uint> list)
