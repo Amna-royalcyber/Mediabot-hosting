@@ -23,6 +23,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 
     private ParticipantIdentity _participant;
     private Task? _sessionTask;
+    private string? _lastFinalTranscript;
 
     public TranscribeStreamService(
         BotSettings settings,
@@ -130,9 +131,21 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                 continue;
             }
 
+            // Avoid flooding downstream with partial stabilization updates.
+            if (result.IsPartial == true)
+            {
+                continue;
+            }
+
+            if (string.Equals(_lastFinalTranscript, text, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            _lastFinalTranscript = text;
+
             await _aggregator.PublishAsync(new TranscriptFragment(
                 AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
-                Kind: result.IsPartial == true ? "Partial" : "Final",
+                Kind: "Final",
                 Text: text,
                 UserId: participant.UserId,
                 DisplayName: participant.DisplayName));
