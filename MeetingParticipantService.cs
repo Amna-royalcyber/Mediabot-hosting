@@ -65,6 +65,18 @@ public sealed class MeetingParticipantService
             }
         };
 
+        try
+        {
+            foreach (var p in participants)
+            {
+                IngestParticipant(p, botAzureAdApplicationClientId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not ingest existing call participants into roster.");
+        }
+
         _logger.LogInformation("Subscribed to call participant roster updates; Entra profiles resolved via Microsoft Graph when needed.");
     }
 

@@ -12,16 +12,19 @@ public sealed class ParticipantAudioRouter
 {
     private readonly AudioProcessor _audioProcessor;
     private readonly AwsTranscribeService _awsTranscribeService;
+    private readonly MeetingParticipantService _meetingParticipants;
     private readonly ILogger<ParticipantAudioRouter> _logger;
     private readonly ConcurrentDictionary<uint, ParticipantAudioBinding> _bindingBySourceId = new();
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
         AwsTranscribeService awsTranscribeService,
+        MeetingParticipantService meetingParticipants,
         ILogger<ParticipantAudioRouter> logger)
     {
         _audioProcessor = audioProcessor;
         _awsTranscribeService = awsTranscribeService;
+        _meetingParticipants = meetingParticipants;
         _logger = logger;
     }
 
@@ -42,6 +45,24 @@ public sealed class ParticipantAudioRouter
                 RemoveParticipantMappings(p);
             }
         };
+
+        // Roster may already contain participants before delta events; hydrate bindings immediately.
+        TryHydrateFromCurrentRoster(call, botClientId);
+    }
+
+    private void TryHydrateFromCurrentRoster(ICall call, string botClientId)
+    {
+        try
+        {
+            foreach (var p in call.Participants)
+            {
+                UpsertParticipantMappings(p, botClientId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not hydrate participant source bindings from current roster.");
+        }
     }
 
     public async Task HandleAudioAsync(AudioMediaReceivedEventArgs args)
@@ -62,8 +83,22 @@ public sealed class ParticipantAudioRouter
 
             if (!_bindingBySourceId.TryGetValue(sourceId, out var binding))
             {
-                _logger.LogWarning("No participant binding for sourceId {SourceId}.", sourceId);
-                continue;
+                if (TryBindSingleRosterParticipant(sourceId, out var fallback) && fallback is not null)
+                {
+                    binding = fallback;
+                    _logger.LogWarning(
+                        "Mapped unmapped sourceId {SourceId} to sole roster participant {DisplayName} ({ParticipantId}).",
+                        sourceId,
+                        binding.DisplayName,
+                        binding.ParticipantId);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "No participant binding for sourceId {SourceId}. Ensure Graph participant mediaStreams includes sourceId, or add more participants to roster.",
+                        sourceId);
+                    continue;
+                }
             }
 
             var payload = CopyUnmixedBuffer(ub.Data, ub.Length);
@@ -140,6 +175,26 @@ public sealed class ParticipantAudioRouter
         _awsTranscribeService.RemoveParticipant(participantId.Trim());
     }
 
+    /// <summary>
+    /// When Teams does not expose mediaStreams.sourceId in callbacks, unmixed audio still uses a source id.
+    /// If exactly one human is in the roster, bind that speaker (typical 1:1 test call).
+    /// </summary>
+    private bool TryBindSingleRosterParticipant(uint sourceId, out ParticipantAudioBinding? binding)
+    {
+        binding = null;
+        var roster = _meetingParticipants.GetRosterSnapshot();
+        if (roster.Count != 1)
+        {
+            return false;
+        }
+
+        var single = roster[0];
+        binding = new ParticipantAudioBinding(single.AzureAdObjectId, single.DisplayName);
+        _bindingBySourceId[sourceId] = binding;
+        _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
+        return true;
+    }
+
     private static List<uint> TryExtractSourceIds(Microsoft.Graph.Models.Participant? participant)
     {
         var list = new List<uint>();
@@ -148,22 +203,78 @@ public sealed class ParticipantAudioRouter
             return list;
         }
 
-        object? mediaStreams = null;
+        object? msObj = null;
         foreach (var kvp in participant.AdditionalData)
         {
             if (string.Equals(kvp.Key, "mediaStreams", StringComparison.OrdinalIgnoreCase))
             {
-                mediaStreams = kvp.Value;
+                msObj = kvp.Value;
                 break;
             }
         }
 
-        if (mediaStreams is JsonElement je && je.ValueKind == JsonValueKind.Array)
+        if (msObj is null)
+        {
+            return list;
+        }
+
+        if (msObj is JsonElement je && je.ValueKind == JsonValueKind.Array)
         {
             foreach (var stream in je.EnumerateArray())
             {
-                if (stream.ValueKind != JsonValueKind.Object ||
-                    !stream.TryGetProperty("sourceId", out var src))
+                if (stream.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                if (stream.TryGetProperty("sourceId", out var src))
+                {
+                    if (src.ValueKind == JsonValueKind.Number && src.TryGetUInt32(out var n))
+                    {
+                        list.Add(n);
+                    }
+                    else if (src.ValueKind == JsonValueKind.String &&
+                             uint.TryParse(src.GetString(), out var s))
+                    {
+                        list.Add(s);
+                    }
+                }
+            }
+        }
+        else if (msObj is JsonElement js && js.ValueKind == JsonValueKind.String)
+        {
+            var raw = js.GetString();
+            if (!string.IsNullOrWhiteSpace(raw) && TryParseFromJson(raw, list))
+            {
+                return list;
+            }
+        }
+        else if (msObj is string str && TryParseFromJson(str, list))
+        {
+            return list;
+        }
+
+        return list;
+    }
+
+    private static bool TryParseFromJson(string json, List<uint> list)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            foreach (var stream in doc.RootElement.EnumerateArray())
+            {
+                if (stream.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                if (!stream.TryGetProperty("sourceId", out var src))
                 {
                     continue;
                 }
@@ -173,14 +284,18 @@ public sealed class ParticipantAudioRouter
                     list.Add(n);
                 }
                 else if (src.ValueKind == JsonValueKind.String &&
-                         uint.TryParse(src.GetString(), out var parsed))
+                         uint.TryParse(src.GetString(), out var s))
                 {
-                    list.Add(parsed);
+                    list.Add(s);
                 }
             }
-        }
 
-        return list;
+            return list.Count > 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static byte[] CopyUnmixedBuffer(IntPtr ptr, long length)
