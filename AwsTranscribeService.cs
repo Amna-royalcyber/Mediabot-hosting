@@ -82,6 +82,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
 internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 {
+    private readonly BotSettings _settings;
     private readonly AmazonTranscribeStreamingClient _client;
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
     private readonly ILogger<ParticipantTranscribeSession> _logger;
@@ -105,6 +106,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         TranscriptBroadcaster transcriptBroadcaster,
         ILogger<ParticipantTranscribeSession> logger)
     {
+        _settings = settings;
         _participantId = participantId;
         _displayName = displayName;
         _transcriptBroadcaster = transcriptBroadcaster;
@@ -147,7 +149,8 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             MediaSampleRateHertz = 16000,
             ShowSpeakerLabel = false,
             EnablePartialResultsStabilization = true,
-            PartialResultsStability = PartialResultsStability.High,
+            // Medium balances latency vs. partial stability; High adds noticeable delay.
+            PartialResultsStability = PartialResultsStability.Medium,
             AudioStreamPublisher = GetNextAudioEventAsync
         };
 
@@ -213,7 +216,8 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                     continue;
                 }
 
-                if ((DateTime.UtcNow - _lastPartialUtc).TotalMilliseconds < 250)
+                var minPartialGap = Math.Clamp(_settings.TranscribePartialMinIntervalMilliseconds, 30, 500);
+                if ((DateTime.UtcNow - _lastPartialUtc).TotalMilliseconds < minPartialGap)
                 {
                     continue;
                 }
@@ -245,7 +249,8 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
     private async Task<IAudioStreamEvent> GetNextAudioEventAsync()
     {
-        const int targetChunkBytes = 16_000 * 2 * 320 / 1000;
+        var chunkMs = Math.Clamp(_settings.TranscribeAudioChunkMilliseconds, 50, 500);
+        var targetChunkBytes = 16_000 * 2 * chunkMs / 1000;
         var merged = new List<byte>(targetChunkBytes);
 
         while (merged.Count < targetChunkBytes && !_cts.IsCancellationRequested)

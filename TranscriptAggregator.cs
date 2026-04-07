@@ -16,14 +16,16 @@ public sealed record TranscriptFragment(
 /// </summary>
 public sealed class TranscriptAggregator : BackgroundService
 {
+    private readonly BotSettings _settings;
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly ILogger<TranscriptAggregator> _logger;
     private readonly Channel<TranscriptFragment> _incoming = Channel.CreateUnbounded<TranscriptFragment>();
     private readonly PriorityQueue<TranscriptFragment, long> _timeline = new();
     private readonly object _lock = new();
 
-    public TranscriptAggregator(TranscriptBroadcaster broadcaster, ILogger<TranscriptAggregator> logger)
+    public TranscriptAggregator(BotSettings settings, TranscriptBroadcaster broadcaster, ILogger<TranscriptAggregator> logger)
     {
+        _settings = settings;
         _broadcaster = broadcaster;
         _logger = logger;
     }
@@ -47,7 +49,11 @@ public sealed class TranscriptAggregator : BackgroundService
 
     private async Task DrainAsync(CancellationToken cancellationToken)
     {
-        await Task.Delay(120, cancellationToken);
+        var mergeMs = Math.Clamp(_settings.TranscriptTimelineMergeMilliseconds, 0, 200);
+        if (mergeMs > 0)
+        {
+            await Task.Delay(mergeMs, cancellationToken);
+        }
 
         while (true)
         {

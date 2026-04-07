@@ -13,6 +13,7 @@ public sealed record ParticipantIdentity(string UserId, string DisplayName);
 /// </summary>
 public sealed class TranscribeStreamService : IAsyncDisposable
 {
+    private readonly BotSettings _settings;
     private readonly AmazonTranscribeStreamingClient _client;
     private readonly TranscriptAggregator _aggregator;
     private readonly ILogger<TranscribeStreamService> _logger;
@@ -34,6 +35,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         ParticipantIdentity participant,
         ILogger<TranscribeStreamService> logger)
     {
+        _settings = settings;
         _aggregator = aggregator;
         _participant = participant;
         _logger = logger;
@@ -80,7 +82,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
             MediaSampleRateHertz = 16000,
             ShowSpeakerLabel = false,
             EnablePartialResultsStabilization = true,
-            PartialResultsStability = PartialResultsStability.High,
+            PartialResultsStability = PartialResultsStability.Medium,
             AudioStreamPublisher = GetNextAudioEventAsync
         };
 
@@ -148,7 +150,8 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                     continue;
                 }
 
-                if ((now - _lastPartialSentAtUtc).TotalMilliseconds < 250)
+                var minGap = Math.Clamp(_settings.TranscribePartialMinIntervalMilliseconds, 30, 500);
+                if ((now - _lastPartialSentAtUtc).TotalMilliseconds < minGap)
                 {
                     continue;
                 }
@@ -181,7 +184,8 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 
     private async Task<IAudioStreamEvent> GetNextAudioEventAsync()
     {
-        const int targetChunkBytes = 16_000 * 2 * 320 / 1000;
+        var chunkMs = Math.Clamp(_settings.TranscribeAudioChunkMilliseconds, 50, 500);
+        var targetChunkBytes = 16_000 * 2 * chunkMs / 1000;
         var merged = new List<byte>(targetChunkBytes);
 
         while (merged.Count < targetChunkBytes && !_cts.IsCancellationRequested)
