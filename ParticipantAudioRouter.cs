@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
+using System.Linq;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Resources;
@@ -23,6 +24,13 @@ public sealed class ParticipantAudioRouter
     private int _loggedMixedMode;
     private int _loggedUnmappedDominantMixed;
     private int _loggedDominantNotYetMixed;
+    private int _loggedHeuristicMultiInference;
+
+    /// <summary>Order in which previously unknown source ids first appeared (for pairing with roster when Graph omits mediaStreams).</summary>
+    private readonly object _inferLock = new();
+
+    private readonly List<uint> _sourceIdDiscoveryOrder = new();
+    private readonly ConcurrentDictionary<uint, byte> _warnedUnmappedSourceIds = new();
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
@@ -38,6 +46,11 @@ public sealed class ParticipantAudioRouter
 
     public void AttachToCall(ICall call, string botClientId)
     {
+        lock (_inferLock)
+        {
+            _sourceIdDiscoveryOrder.Clear();
+        }
+
         call.Participants.OnUpdated += (_, args) =>
         {
             foreach (var p in args.AddedResources)
@@ -93,20 +106,10 @@ public sealed class ParticipantAudioRouter
 
             if (!_bindingBySourceId.TryGetValue(sourceId, out var binding))
             {
-                if (TryBindSingleRosterParticipant(sourceId, out var fallback) && fallback is not null)
+                var roster = _meetingParticipants.GetRosterSnapshot();
+                if (!TryInferBindingForUnmappedSource(sourceId, roster, out binding))
                 {
-                    binding = fallback;
-                    _logger.LogWarning(
-                        "Mapped unmapped sourceId {SourceId} to sole roster participant {DisplayName} ({ParticipantId}).",
-                        sourceId,
-                        binding.DisplayName,
-                        binding.ParticipantId);
-                }
-                else
-                {
-                    _logger.LogWarning(
-                        "No participant binding for sourceId {SourceId}. Ensure Graph participant mediaStreams includes sourceId, or add more participants to roster.",
-                        sourceId);
+                    LogUnmappedSourceIdOnce(sourceId);
                     continue;
                 }
             }
@@ -192,6 +195,92 @@ public sealed class ParticipantAudioRouter
     public void SetDominantSpeaker(uint sourceId)
     {
         _dominantSourceId = sourceId;
+    }
+
+    /// <summary>
+    /// Graph often omits <c>mediaStreams[].sourceId</c> for some participants. Map unmixed <paramref name="sourceId"/>
+    /// to the roster user who is not yet tied to any source, or pair by discovery order vs sorted display names.
+    /// </summary>
+    private bool TryInferBindingForUnmappedSource(
+        uint sourceId,
+        IReadOnlyList<RosterParticipantDto> roster,
+        out ParticipantAudioBinding binding)
+    {
+        binding = default!;
+        lock (_inferLock)
+        {
+            if (_bindingBySourceId.TryGetValue(sourceId, out var race))
+            {
+                binding = race;
+                return true;
+            }
+
+            var mappedUserIds = new HashSet<string>(
+                _bindingBySourceId.Values.Select(v => v.ParticipantId),
+                StringComparer.OrdinalIgnoreCase);
+
+            var unmappedHumans = roster
+                .Where(r => !mappedUserIds.Contains(r.AzureAdObjectId))
+                .ToList();
+
+            if (unmappedHumans.Count == 0)
+            {
+                return false;
+            }
+
+            if (unmappedHumans.Count == 1)
+            {
+                var p = unmappedHumans[0];
+                binding = new ParticipantAudioBinding(p.AzureAdObjectId, p.DisplayName);
+                _bindingBySourceId[sourceId] = binding;
+                _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
+                _logger.LogInformation(
+                    "Inferred sourceId {SourceId} → {DisplayName} (only roster user without a Graph mediaStreams sourceId).",
+                    sourceId,
+                    binding.DisplayName);
+                return true;
+            }
+
+            if (!_sourceIdDiscoveryOrder.Contains(sourceId))
+            {
+                _sourceIdDiscoveryOrder.Add(sourceId);
+            }
+
+            var sorted = unmappedHumans.OrderBy(h => h.DisplayName, StringComparer.OrdinalIgnoreCase).ToList();
+            var idx = _sourceIdDiscoveryOrder.IndexOf(sourceId);
+            if (idx < 0)
+            {
+                return false;
+            }
+
+            idx = Math.Min(idx, sorted.Count - 1);
+            var pick = sorted[idx];
+            binding = new ParticipantAudioBinding(pick.AzureAdObjectId, pick.DisplayName);
+            _bindingBySourceId[sourceId] = binding;
+            _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
+            if (Interlocked.Increment(ref _loggedHeuristicMultiInference) == 1)
+            {
+                _logger.LogWarning(
+                    "Several participants lack mediaStreams sourceId in Graph. Pairing new source ids to roster users by first-seen order vs sorted display names (best-effort).");
+            }
+
+            _logger.LogDebug(
+                "Inferred sourceId {SourceId} → {DisplayName} (heuristic index {Idx}).",
+                sourceId,
+                binding.DisplayName,
+                idx);
+            return true;
+        }
+    }
+
+    private void LogUnmappedSourceIdOnce(uint sourceId)
+    {
+        if (_warnedUnmappedSourceIds.TryAdd(sourceId, 0))
+        {
+            _logger.LogWarning(
+                "Could not infer Entra user for sourceId {SourceId}. Check roster vs participants, or Graph mediaStreams payload.",
+                sourceId);
+        }
     }
 
     private bool TryResolveMixedAttribution(IReadOnlyList<RosterParticipantDto> roster, out ParticipantAudioBinding binding)
@@ -284,26 +373,6 @@ public sealed class ParticipantAudioRouter
         }
 
         _awsTranscribeService.RemoveParticipant(participantId.Trim());
-    }
-
-    /// <summary>
-    /// When Teams does not expose mediaStreams.sourceId in callbacks, unmixed audio still uses a source id.
-    /// If exactly one human is in the roster, bind that speaker (typical 1:1 test call).
-    /// </summary>
-    private bool TryBindSingleRosterParticipant(uint sourceId, out ParticipantAudioBinding? binding)
-    {
-        binding = null;
-        var roster = _meetingParticipants.GetRosterSnapshot();
-        if (roster.Count != 1)
-        {
-            return false;
-        }
-
-        var single = roster[0];
-        binding = new ParticipantAudioBinding(single.AzureAdObjectId, single.DisplayName);
-        _bindingBySourceId[sourceId] = binding;
-        _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
-        return true;
     }
 
     private static List<uint> TryExtractSourceIds(Microsoft.Graph.Models.Participant? participant)
