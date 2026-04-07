@@ -56,7 +56,6 @@ public sealed class BotService
     private readonly BotSettings _settings;
     private readonly CallHandler _callHandler;
     private readonly MediaHandler _mediaHandler;
-    private readonly AwsTranscribeService _awsTranscribeService;
     private readonly ILogger<BotService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IGraphLogger _graphLogger;
@@ -67,14 +66,12 @@ public sealed class BotService
         BotSettings settings,
         CallHandler callHandler,
         MediaHandler mediaHandler,
-        AwsTranscribeService awsTranscribeService,
         ILoggerFactory loggerFactory,
         ILogger<BotService> logger)
     {
         _settings = settings;
         _callHandler = callHandler;
         _mediaHandler = mediaHandler;
-        _awsTranscribeService = awsTranscribeService;
         _loggerFactory = loggerFactory;
         _logger = logger;
         _graphLogger = new GraphLogger(_settings.ClientId);
@@ -121,10 +118,7 @@ public sealed class BotService
         }
 
         _logger.LogInformation("Join request submitted to Graph.");
-
-        // Start Transcribe after join so media can produce PCM before the SDK pulls the first audio chunk (avoids deadlock if the stream waits for upstream audio).
-        await _awsTranscribeService.StartStreamingAsync();
-        _logger.LogInformation("AWS Transcribe streaming session started for this meeting.");
+        _logger.LogInformation("Per-participant Transcribe streams will start as unmixed audio arrives.");
     }
 
     public Task<HttpResponseMessage> ProcessNotificationAsync(HttpRequestMessage request)

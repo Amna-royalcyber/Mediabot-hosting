@@ -9,21 +9,15 @@ namespace TeamsMediaBot;
 public sealed class MediaHandler
 {
     private readonly ILogger<MediaHandler> _logger;
-    private readonly AudioProcessor _audioProcessor;
-    private readonly AwsTranscribeService _awsTranscribeService;
+    private readonly ParticipantAudioStreamHandler _participantAudioStreamHandler;
     private IAudioSocket? _audioSocket;
-    private bool _loggedFirstAudioFrame;
-    private int _pcmFrameCount;
-    private long _pcmBytesTotal;
 
     public MediaHandler(
         ILogger<MediaHandler> logger,
-        AudioProcessor audioProcessor,
-        AwsTranscribeService awsTranscribeService)
+        ParticipantAudioStreamHandler participantAudioStreamHandler)
     {
         _logger = logger;
-        _audioProcessor = audioProcessor;
-        _awsTranscribeService = awsTranscribeService;
+        _participantAudioStreamHandler = participantAudioStreamHandler;
     }
 
     public IMediaSession CreateMediaSession(ICommunicationsClient communicationsClient)
@@ -31,7 +25,9 @@ public sealed class MediaHandler
         var mediaConfiguration = new AudioSocketSettings
         {
             StreamDirections = StreamDirection.Recvonly,
-            SupportedAudioFormat = AudioFormat.Pcm16K
+            SupportedAudioFormat = AudioFormat.Pcm16K,
+            ReceiveUnmixedMeetingAudio = true,
+            EnableAudioHealingForUnmixed = true
         };
 
         var mediaSession = communicationsClient.CreateMediaSession(
@@ -43,67 +39,23 @@ public sealed class MediaHandler
 
         _audioSocket = mediaSession.AudioSocket;
         _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
-        _loggedFirstAudioFrame = false;
-        _pcmFrameCount = 0;
-        _pcmBytesTotal = 0;
-
+        _audioSocket.DominantSpeakerChanged += (_, e) =>
+        {
+            _logger.LogDebug("Dominant speaker MSI changed: {SourceId}", e.CurrentDominantSpeaker);
+        };
         _logger.LogInformation("Media session initialized and audio event subscribed.");
         return mediaSession;
     }
 
-    private void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs args)
+    private async void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs args)
     {
-        int declaredLength = (int)args.Buffer.Length;
-        byte[] extracted = AudioProcessor.ExtractBytes(args.Buffer);
-        if (declaredLength > 0 && extracted.Length == 0)
+        try
         {
-            _logger.LogError(
-                "AudioMediaReceived: buffer Length={DeclaredLen} but ExtractBytes returned 0 bytes (reflection path may not match buffer type).",
-                declaredLength);
+            await _participantAudioStreamHandler.HandleAsync(args);
         }
-
-        var incomingFrame = new AudioFrame(
-            Data: extracted,
-            Timestamp: args.Buffer.Timestamp,
-            Length: declaredLength,
-            Format: AudioFormat.Pcm16K);
-
-        byte[] pcmChunk = _audioProcessor.ConvertToPcm(incomingFrame);
-        if (incomingFrame.Length > 0 && pcmChunk.Length == 0)
+        catch (Exception ex)
         {
-            _logger.LogError(
-                "AudioMediaReceived: non-zero frame length ({FrameLen}) produced empty PCM after ConvertToPcm (format {Format}).",
-                incomingFrame.Length,
-                incomingFrame.Format);
+            _logger.LogError(ex, "Failed handling unmixed participant audio.");
         }
-
-        // AWS Transcribe path uses AwsTranscribeService only. Do not enqueue to AudioProcessor.BufferChunk — nothing consumes it (memory leak on long calls).
-        _awsTranscribeService.SendAudioChunk(pcmChunk);
-
-        if (pcmChunk.Length > 0)
-        {
-            _pcmFrameCount++;
-            _pcmBytesTotal += pcmChunk.Length;
-
-            if (!_loggedFirstAudioFrame)
-            {
-                _loggedFirstAudioFrame = true;
-                _logger.LogInformation(
-                    "First PCM chunk from Teams to Transcribe (length={Length} bytes). Speak in the meeting to drive transcription.",
-                    pcmChunk.Length);
-            }
-            else if (_pcmFrameCount % 100 == 0)
-            {
-                _logger.LogInformation(
-                    "Teams audio still flowing: {Frames} PCM frames, {Kilobytes} KB total sent to Transcribe.",
-                    _pcmFrameCount,
-                    _pcmBytesTotal / 1024);
-            }
-        }
-
-        _logger.LogDebug(
-            "Audio frame received and buffered. Timestamp: {Timestamp}, Length: {Length}",
-            incomingFrame.Timestamp,
-            incomingFrame.Length);
     }
 }
