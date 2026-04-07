@@ -7,10 +7,14 @@ using Microsoft.Extensions.Logging;
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Manages one AWS Transcribe streaming session per participant.
+/// Manages AWS Transcribe streaming: one session per participant when unmixed audio is available,
+/// and one optional "dominant mixed" session when only the main (mixed) buffer is present.
 /// </summary>
 public sealed class AwsTranscribeService : IAsyncDisposable
 {
+    /// <summary>Single session used for mixed meeting audio; identity is updated per chunk from Teams dominant speaker.</summary>
+    public const string DominantMixedSessionKey = "__dominant_mixed__";
+
     private readonly BotSettings _settings;
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
     private readonly ILoggerFactory _loggerFactory;
@@ -60,6 +64,33 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         session.EnqueueAudio(pcmAudio, timestamp);
     }
 
+    /// <summary>
+    /// Sends PCM from the main (mixed) buffer to one Transcribe stream. Call
+    /// <see cref="ParticipantTranscribeSession.UpdateTranscriptIdentity"/> before each chunk so transcripts use the current speaker (Teams dominant MSI → Entra user).
+    /// </summary>
+    public async Task SendMixedDominantAudioAsync(string participantId, string displayName, byte[] pcmAudio, long timestamp)
+    {
+        if (pcmAudio.Length == 0)
+        {
+            return;
+        }
+
+        UpsertParticipant(DominantMixedSessionKey, displayName);
+
+        var session = _sessions.GetOrAdd(
+            DominantMixedSessionKey,
+            _ => new ParticipantTranscribeSession(
+                _settings,
+                DominantMixedSessionKey,
+                displayName,
+                _transcriptBroadcaster,
+                _loggerFactory.CreateLogger<ParticipantTranscribeSession>()));
+
+        session.UpdateTranscriptIdentity(participantId, displayName);
+        await session.EnsureStartedAsync();
+        session.EnqueueAudio(pcmAudio, timestamp);
+    }
+
     public void RemoveParticipant(string participantId)
     {
         _displayNames.TryRemove(participantId, out _);
@@ -87,7 +118,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
     private readonly ILogger<ParticipantTranscribeSession> _logger;
     private readonly bool _broadcastPartials;
-    private readonly string _participantId;
+    private string _participantId;
     private readonly ConcurrentQueue<byte[]> _audioQueue = new();
     private readonly SemaphoreSlim _audioSignal = new(0);
     private readonly CancellationTokenSource _cts = new();
@@ -119,6 +150,16 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
     {
         lock (_stateLock)
         {
+            _displayName = displayName;
+        }
+    }
+
+    /// <summary>Used for the dominant-mixed session so transcript lines carry the current Teams speaker (Entra id + name).</summary>
+    public void UpdateTranscriptIdentity(string participantId, string displayName)
+    {
+        lock (_stateLock)
+        {
+            _participantId = participantId;
             _displayName = displayName;
         }
     }
@@ -186,9 +227,11 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         }
 
         string displayName;
+        string participantIdForBroadcast;
         lock (_stateLock)
         {
             displayName = _displayName;
+            participantIdForBroadcast = _participantId;
         }
 
         foreach (var result in te.Transcript.Results)
@@ -228,7 +271,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                     "Partial",
                     text,
                     speakerLabel: displayName,
-                    azureAdObjectId: _participantId);
+                    azureAdObjectId: participantIdForBroadcast);
                 continue;
             }
 
@@ -243,7 +286,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 "Final",
                 text,
                 speakerLabel: displayName,
-                azureAdObjectId: _participantId);
+                azureAdObjectId: participantIdForBroadcast);
         }
     }
 

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Resources;
@@ -15,6 +16,13 @@ public sealed class ParticipantAudioRouter
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ILogger<ParticipantAudioRouter> _logger;
     private readonly ConcurrentDictionary<uint, ParticipantAudioBinding> _bindingBySourceId = new();
+
+    /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
+    private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
+
+    private int _loggedMixedMode;
+    private int _loggedUnmappedDominantMixed;
+    private int _loggedDominantNotYetMixed;
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
@@ -70,6 +78,8 @@ public sealed class ParticipantAudioRouter
         var unmixed = args.Buffer.UnmixedAudioBuffers;
         if (unmixed is null || !unmixed.Any())
         {
+            // Many Teams builds/skus still deliver only the main (mixed) buffer; unmixed may be empty forever.
+            await TrySendMainBufferMixedDominantAsync(args);
             return;
         }
 
@@ -125,6 +135,107 @@ public sealed class ParticipantAudioRouter
                 pcm,
                 ub.OriginalSenderTimestamp);
         }
+    }
+
+    /// <summary>
+    /// Mixed meeting audio (single buffer) — attribute text to the participant mapped from Teams <strong>dominant speaker</strong>
+    /// source id (MSI), using Graph <c>mediaStreams[].sourceId</c> → Entra user. If the dominant id is not mapped yet,
+    /// we fall back to the first roster entry (degraded) so you still get transcripts.
+    /// </summary>
+    private async Task TrySendMainBufferMixedDominantAsync(AudioMediaReceivedEventArgs args)
+    {
+        var declaredLength = (int)args.Buffer.Length;
+        var extracted = AudioProcessor.ExtractBytes(args.Buffer);
+        if (declaredLength > 0 && extracted.Length == 0)
+        {
+            _logger.LogTrace("Main audio buffer had Length={Len} but ExtractBytes returned 0.", declaredLength);
+            return;
+        }
+
+        var pcm = _audioProcessor.ConvertToPcm(new AudioFrame(
+            Data: extracted,
+            Timestamp: args.Buffer.Timestamp,
+            Length: declaredLength,
+            Format: AudioFormat.Pcm16K));
+        if (pcm.Length == 0)
+        {
+            return;
+        }
+
+        var roster = _meetingParticipants.GetRosterSnapshot();
+        if (roster.Count == 0)
+        {
+            _logger.LogDebug("Main audio buffer received but roster is empty (participants not ingested yet).");
+            return;
+        }
+
+        if (!TryResolveMixedAttribution(roster, out var binding))
+        {
+            return;
+        }
+
+        if (Interlocked.Increment(ref _loggedMixedMode) == 1)
+        {
+            _logger.LogInformation(
+                "Using mixed main audio buffer with dominant-speaker labeling (sourceId map + Teams dominant MSI). " +
+                "For per-person audio without mixing, enable unmixed meeting audio when the client supports it.");
+        }
+
+        await _awsTranscribeService.SendMixedDominantAudioAsync(
+            binding.ParticipantId,
+            binding.DisplayName,
+            pcm,
+            args.Buffer.Timestamp);
+    }
+
+    /// <summary>Teams raises dominant speaker MSI; must align with participant mediaStreams sourceId for correct names.</summary>
+    public void SetDominantSpeaker(uint sourceId)
+    {
+        _dominantSourceId = sourceId;
+    }
+
+    private bool TryResolveMixedAttribution(IReadOnlyList<RosterParticipantDto> roster, out ParticipantAudioBinding binding)
+    {
+        binding = default!;
+        var none = (uint)DominantSpeakerChangedEventArgs.None;
+        var dom = _dominantSourceId;
+
+        if (dom != none && _bindingBySourceId.TryGetValue(dom, out var mapped))
+        {
+            binding = mapped;
+            return true;
+        }
+
+        if (roster.Count == 1)
+        {
+            binding = new ParticipantAudioBinding(roster[0].AzureAdObjectId, roster[0].DisplayName);
+            return true;
+        }
+
+        if (dom != none)
+        {
+            if (Interlocked.Increment(ref _loggedUnmappedDominantMixed) == 1)
+            {
+                _logger.LogWarning(
+                    "Mixed audio: dominant sourceId {SourceId} is not bound to an Entra user yet. " +
+                    "Ensure Graph participant updates include mediaStreams with matching sourceId. " +
+                    "Using first roster participant as temporary label.",
+                    dom);
+            }
+
+            binding = new ParticipantAudioBinding(roster[0].AzureAdObjectId, roster[0].DisplayName);
+            return true;
+        }
+
+        if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
+        {
+            _logger.LogWarning(
+                "Mixed audio: dominant speaker not reported yet; labeling transcripts as {Name} until MSI arrives.",
+                roster[0].DisplayName);
+        }
+
+        binding = new ParticipantAudioBinding(roster[0].AzureAdObjectId, roster[0].DisplayName);
+        return true;
     }
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)

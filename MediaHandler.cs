@@ -41,7 +41,9 @@ public sealed class MediaHandler
         _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
         _audioSocket.DominantSpeakerChanged += (_, e) =>
         {
-            _logger.LogDebug("Dominant speaker source changed to {SourceId}", e.CurrentDominantSpeaker);
+            var sid = Convert.ToUInt32(e.CurrentDominantSpeaker);
+            _participantAudioRouter.SetDominantSpeaker(sid);
+            _logger.LogDebug("Dominant speaker source id (MSI) set to {SourceId}", sid);
         };
 
         _logger.LogInformation("Media session initialized with unmixed meeting audio.");
