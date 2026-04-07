@@ -18,7 +18,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, TranscribeStreamService> _streamsBySourceId = new();
     private readonly ConcurrentDictionary<uint, ParticipantIdentity> _participantBySourceId = new();
     private readonly ConcurrentDictionary<string, List<uint>> _sourceIdsByUserId = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<uint, byte> _unresolvedSourceIds = new();
 
     public TranscriptionManager(
         BotSettings settings,
@@ -62,13 +61,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
             ? mapped
             : new ParticipantIdentity($"source:{sourceId}", $"Speaker {sourceId}");
 
-        if (mapped is null && _unresolvedSourceIds.TryAdd(sourceId, 0))
-        {
-            _logger.LogWarning(
-                "No participant mapping for sourceId {SourceId}. Waiting for roster mediaStreams source mapping.",
-                sourceId);
-        }
-
         var stream = _streamsBySourceId.GetOrAdd(sourceId, _ =>
         {
             var s = new TranscribeStreamService(
@@ -111,10 +103,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
         var sourceIds = TryExtractSourceIds(resource);
         if (sourceIds.Count == 0)
         {
-            _logger.LogDebug(
-                "Participant {UserId} ({DisplayName}) has no sourceId in AdditionalData media streams yet.",
-                identityRecord.UserId,
-                identityRecord.DisplayName);
             return;
         }
 
@@ -122,12 +110,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
         foreach (var sourceId in sourceIds)
         {
             _participantBySourceId[sourceId] = identityRecord;
-            _unresolvedSourceIds.TryRemove(sourceId, out _);
-            _logger.LogInformation(
-                "Mapped sourceId {SourceId} -> {DisplayName} ({UserId}).",
-                sourceId,
-                identityRecord.DisplayName,
-                identityRecord.UserId);
             if (_streamsBySourceId.TryGetValue(sourceId, out var stream))
             {
                 stream.UpdateParticipant(identityRecord);
@@ -166,17 +148,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
             return list;
         }
 
-        object? msObj = null;
-        foreach (var kvp in participant.AdditionalData)
-        {
-            if (string.Equals(kvp.Key, "mediaStreams", StringComparison.OrdinalIgnoreCase))
-            {
-                msObj = kvp.Value;
-                break;
-            }
-        }
-
-        if (msObj is null)
+        if (!participant.AdditionalData.TryGetValue("mediaStreams", out var msObj) || msObj is null)
         {
             return list;
         }
@@ -204,61 +176,8 @@ public sealed class TranscriptionManager : IAsyncDisposable
                 }
             }
         }
-        else if (msObj is JsonElement js && js.ValueKind == JsonValueKind.String)
-        {
-            var raw = js.GetString();
-            if (!string.IsNullOrWhiteSpace(raw) && TryParseFromJson(raw, list))
-            {
-                return list;
-            }
-        }
-        else if (msObj is string str && TryParseFromJson(str, list))
-        {
-            return list;
-        }
 
         return list;
-    }
-
-    private static bool TryParseFromJson(string json, List<uint> list)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.ValueKind != JsonValueKind.Array)
-            {
-                return false;
-            }
-
-            foreach (var stream in doc.RootElement.EnumerateArray())
-            {
-                if (stream.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-
-                if (!stream.TryGetProperty("sourceId", out var src))
-                {
-                    continue;
-                }
-
-                if (src.ValueKind == JsonValueKind.Number && src.TryGetUInt32(out var n))
-                {
-                    list.Add(n);
-                }
-                else if (src.ValueKind == JsonValueKind.String &&
-                         uint.TryParse(src.GetString(), out var s))
-                {
-                    list.Add(s);
-                }
-            }
-
-            return list.Count > 0;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     public async ValueTask DisposeAsync()
