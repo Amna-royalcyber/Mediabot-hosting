@@ -19,6 +19,9 @@ public sealed class TranscriptionManager : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, ParticipantIdentity> _participantBySourceId = new();
     private readonly ConcurrentDictionary<string, List<uint>> _sourceIdsByUserId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<uint, byte> _unresolvedSourceIds = new();
+    private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private ICall? _attachedCall;
+    private string? _botClientId;
 
     public TranscriptionManager(
         BotSettings settings,
@@ -34,6 +37,9 @@ public sealed class TranscriptionManager : IAsyncDisposable
 
     public void AttachToCall(ICall call, string botClientId)
     {
+        _attachedCall = call;
+        _botClientId = botClientId;
+
         call.Participants.OnUpdated += (_, args) =>
         {
             foreach (var p in args.AddedResources)
@@ -49,6 +55,8 @@ public sealed class TranscriptionManager : IAsyncDisposable
                 RemoveParticipantMappings(p);
             }
         };
+
+        TryHydrateFromCurrentRoster();
     }
 
     public async Task ProcessParticipantAudioAsync(uint sourceId, byte[] pcmChunk, long timestamp)
@@ -67,6 +75,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
                     sourceId);
             }
 
+            _ = RefreshMappingsFromRosterAsync();
             return;
         }
 
@@ -291,6 +300,59 @@ public sealed class TranscriptionManager : IAsyncDisposable
         return $"keys=[{keys}], mediaStreams={mediaText}";
     }
 
+    private void TryHydrateFromCurrentRoster()
+    {
+        var call = _attachedCall;
+        var botClientId = _botClientId;
+        if (call is null || string.IsNullOrWhiteSpace(botClientId))
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (var participant in call.Participants)
+            {
+                UpsertParticipantMappings(participant, botClientId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to hydrate participant mappings from current roster.");
+        }
+    }
+
+    private async Task RefreshMappingsFromRosterAsync()
+    {
+        var call = _attachedCall;
+        var botClientId = _botClientId;
+        if (call is null || string.IsNullOrWhiteSpace(botClientId))
+        {
+            return;
+        }
+
+        if (!await _refreshLock.WaitAsync(0))
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (var participant in call.Participants)
+            {
+                UpsertParticipantMappings(participant, botClientId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Roster refresh for source-id mapping failed.");
+        }
+        finally
+        {
+            _refreshLock.Release();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         foreach (var stream in _streamsBySourceId.Values)
@@ -299,5 +361,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
         }
 
         _streamsBySourceId.Clear();
+        _refreshLock.Dispose();
     }
 }
