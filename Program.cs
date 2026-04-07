@@ -56,13 +56,10 @@ public static class Program
         });
 
         builder.Services.AddSingleton<TranscriptBroadcaster>();
-        builder.Services.AddSingleton<TranscriptAggregator>();
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());
         builder.Services.AddSingleton<EntraUserResolver>();
         builder.Services.AddSingleton<MeetingParticipantService>();
-        builder.Services.AddSingleton<TranscriptionManager>();
-        builder.Services.AddSingleton<ParticipantAudioStreamHandler>();
         builder.Services.AddSingleton<AudioProcessor>();
+        builder.Services.AddSingleton<AwsTranscribeService>();
         builder.Services.AddSingleton<MediaHandler>();
         builder.Services.AddSingleton<CallHandler>();
         builder.Services.AddSingleton<BotService>();

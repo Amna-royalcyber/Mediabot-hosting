@@ -14,19 +14,13 @@ public sealed class CallHandler
 {
     private readonly BotSettings _settings;
     private readonly MeetingParticipantService _meetingParticipants;
-    private readonly TranscriptionManager _transcriptionManager;
     private readonly ILogger<CallHandler> _logger;
     private ICommunicationsClient? _communicationsClient;
 
-    public CallHandler(
-        BotSettings settings,
-        MeetingParticipantService meetingParticipants,
-        TranscriptionManager transcriptionManager,
-        ILogger<CallHandler> logger)
+    public CallHandler(BotSettings settings, MeetingParticipantService meetingParticipants, ILogger<CallHandler> logger)
     {
         _settings = settings;
         _meetingParticipants = meetingParticipants;
-        _transcriptionManager = transcriptionManager;
         _logger = logger;
     }
 
@@ -179,7 +173,6 @@ public sealed class CallHandler
         };
 
         _meetingParticipants.AttachToCall(call, _settings.ClientId);
-        _transcriptionManager.AttachToCall(call, _settings.ClientId);
 
         _logger.LogInformation("Join request submitted. Call ID: {CallId}, ScenarioId={ScenarioId}", call.Id, scenarioId);
         return call;
