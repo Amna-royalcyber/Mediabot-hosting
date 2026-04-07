@@ -52,7 +52,7 @@ public static class Program
             MediaUdpPortMax = ReadOptionalUInt(builder.Configuration, "BOT_MEDIA_UDP_PORT_MAX", "Media:UdpPortMax"),
             MediaServiceFqdn = ReadOptional(builder.Configuration, "BOT_MEDIA_SERVICE_FQDN", "Media:ServiceFqdn"),
             JoinMeetingSubject = ReadOptional(builder.Configuration, "BOT_JOIN_MEETING_SUBJECT", "Bot:JoinMeetingSubject"),
-            TranscriptBroadcastPartials = ReadBool(builder.Configuration, "BOT_TRANSCRIPT_BROADCAST_PARTIALS", "Bot:TranscriptBroadcastPartials", defaultValue: true),
+            TranscriptBroadcastPartials = ReadBool(builder.Configuration, "BOT_TRANSCRIPT_BROADCAST_PARTIALS", "Bot:TranscriptBroadcastPartials", defaultValue: false),
             TranscribeAudioChunkMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIBE_CHUNK_MS", "Bot:TranscribeAudioChunkMilliseconds", 100),
             TranscribePartialMinIntervalMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIBE_PARTIAL_MS", "Bot:TranscribePartialMinIntervalMilliseconds", 90),
             TranscriptTimelineMergeMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIPT_TIMELINE_MS", "Bot:TranscriptTimelineMergeMilliseconds", 20)

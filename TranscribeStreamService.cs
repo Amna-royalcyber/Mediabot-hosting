@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using Amazon;
 using Amazon.TranscribeStreaming;
 using Amazon.TranscribeStreaming.Model;
@@ -14,7 +15,6 @@ public sealed record ParticipantIdentity(string UserId, string DisplayName);
 public sealed class TranscribeStreamService : IAsyncDisposable
 {
     private readonly BotSettings _settings;
-    private readonly AmazonTranscribeStreamingClient _client;
     private readonly TranscriptAggregator _aggregator;
     private readonly ILogger<TranscribeStreamService> _logger;
     private readonly bool _broadcastPartials;
@@ -22,10 +22,11 @@ public sealed class TranscribeStreamService : IAsyncDisposable
     private readonly SemaphoreSlim _signal = new(0);
     private readonly CancellationTokenSource _cts = new();
     private readonly object _participantLock = new();
+    private readonly object _runLock = new();
 
     private ParticipantIdentity _participant;
     private Task? _sessionTask;
-    private string? _lastFinalTranscript;
+    private string? _lastFinalDedupeKey;
     private string? _lastPartialTranscript;
     private DateTime _lastPartialSentAtUtc = DateTime.MinValue;
 
@@ -40,7 +41,6 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         _participant = participant;
         _logger = logger;
         _broadcastPartials = settings.TranscriptBroadcastPartials;
-        _client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(settings.AwsRegion));
     }
 
     public void UpdateParticipant(ParticipantIdentity participant)
@@ -53,12 +53,16 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 
     public Task EnsureStartedAsync()
     {
-        if (_sessionTask is not null)
+        lock (_runLock)
         {
-            return Task.CompletedTask;
+            if (_sessionTask is not null && !_sessionTask.IsCompleted)
+            {
+                return Task.CompletedTask;
+            }
+
+            _sessionTask = RunSessionLoopAsync();
         }
 
-        _sessionTask = RunSessionAsync();
         return Task.CompletedTask;
     }
 
@@ -73,41 +77,56 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         _signal.Release();
     }
 
-    private async Task RunSessionAsync()
+    private async Task RunSessionLoopAsync()
     {
-        var req = new StartStreamTranscriptionRequest
+        var attempt = 0;
+        while (!_cts.IsCancellationRequested)
         {
-            LanguageCode = LanguageCode.EnUS,
-            MediaEncoding = MediaEncoding.Pcm,
-            MediaSampleRateHertz = 16000,
-            ShowSpeakerLabel = false,
-            EnablePartialResultsStabilization = true,
-            PartialResultsStability = PartialResultsStability.Medium,
-            AudioStreamPublisher = GetNextAudioEventAsync
-        };
-
-        try
-        {
-            using var res = await _client.StartStreamTranscriptionAsync(req, _cts.Token);
-            var stream = res.TranscriptResultStream;
-            stream.TranscriptEventReceived += (_, e) =>
+            attempt++;
+            using var client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(_settings.AwsRegion));
+            var req = new StartStreamTranscriptionRequest
             {
-                if (e.EventStreamEvent is TranscriptEvent te)
-                {
-                    _ = HandleTranscriptAsync(te);
-                }
+                LanguageCode = LanguageCode.EnUS,
+                MediaEncoding = MediaEncoding.Pcm,
+                MediaSampleRateHertz = 16000,
+                ShowSpeakerLabel = false,
+                EnablePartialResultsStabilization = true,
+                PartialResultsStability = PartialResultsStability.Medium,
+                AudioStreamPublisher = GetNextAudioEventAsync
             };
 
-            stream.StartProcessing();
-            await Task.Delay(Timeout.Infinite, _cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // expected on dispose
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Per-participant Transcribe stream failed for {UserId}.", _participant.UserId);
+            try
+            {
+                using var res = await client.StartStreamTranscriptionAsync(req, _cts.Token);
+                var stream = res.TranscriptResultStream;
+                stream.TranscriptEventReceived += (_, e) =>
+                {
+                    if (e.EventStreamEvent is TranscriptEvent te)
+                    {
+                        _ = HandleTranscriptAsync(te);
+                    }
+                };
+
+                stream.StartProcessing();
+                await Task.Delay(Timeout.Infinite, _cts.Token);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Per-participant Transcribe stream failed for {UserId}; retrying.", _participant.UserId);
+                try
+                {
+                    await Task.Delay(Math.Min(5000, 250 * attempt), _cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
         }
     }
 
@@ -167,11 +186,17 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                 continue;
             }
 
-            if (string.Equals(_lastFinalTranscript, text, StringComparison.Ordinal))
+            var start = (double)(result.StartTime ?? 0);
+            var end = (double)(result.EndTime ?? 0);
+            var dedupeKey =
+                start.ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                end.ToString("F6", CultureInfo.InvariantCulture) + "|" + text;
+            if (string.Equals(_lastFinalDedupeKey, dedupeKey, StringComparison.Ordinal))
             {
                 continue;
             }
-            _lastFinalTranscript = text;
+
+            _lastFinalDedupeKey = dedupeKey;
 
             await _aggregator.PublishAsync(new TranscriptFragment(
                 AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
@@ -222,6 +247,5 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 
         _signal.Dispose();
         _cts.Dispose();
-        _client.Dispose();
     }
 }

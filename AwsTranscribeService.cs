@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using Amazon;
 using Amazon.TranscribeStreaming;
 using Amazon.TranscribeStreaming.Model;
@@ -114,7 +115,6 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 {
     private readonly BotSettings _settings;
-    private readonly AmazonTranscribeStreamingClient _client;
     private readonly TranscriptBroadcaster _transcriptBroadcaster;
     private readonly ILogger<ParticipantTranscribeSession> _logger;
     private readonly bool _broadcastPartials;
@@ -123,11 +123,13 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
     private readonly SemaphoreSlim _audioSignal = new(0);
     private readonly CancellationTokenSource _cts = new();
     private readonly object _stateLock = new();
+    private readonly object _runLock = new();
 
     private string _displayName;
     private Task? _sessionTask;
     private string? _lastPartial;
-    private string? _lastFinal;
+    /// <summary>Dedupe only identical AWS segment replays (same start/end/text), not repeated words in a new utterance.</summary>
+    private string? _lastFinalDedupeKey;
     private DateTime _lastPartialUtc = DateTime.MinValue;
 
     public ParticipantTranscribeSession(
@@ -143,7 +145,6 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         _transcriptBroadcaster = transcriptBroadcaster;
         _logger = logger;
         _broadcastPartials = settings.TranscriptBroadcastPartials;
-        _client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(settings.AwsRegion));
     }
 
     public void UpdateDisplayName(string displayName)
@@ -166,12 +167,23 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
     public Task EnsureStartedAsync()
     {
-        if (_sessionTask is not null)
+        lock (_runLock)
         {
-            return Task.CompletedTask;
+            if (_sessionTask is not null && !_sessionTask.IsCompleted)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (_sessionTask?.IsFaulted == true)
+            {
+                _logger.LogWarning(
+                    "Restarting AWS Transcribe stream for session key {SessionKey} after prior failure.",
+                    _participantId);
+            }
+
+            _sessionTask = RunSessionLoopAsync();
         }
 
-        _sessionTask = RunAsync();
         return Task.CompletedTask;
     }
 
@@ -181,41 +193,65 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         _audioSignal.Release();
     }
 
-    private async Task RunAsync()
+    /// <summary>Retries the streaming connection after errors so speech works again after silence or transient AWS failures.</summary>
+    private async Task RunSessionLoopAsync()
     {
-        var request = new StartStreamTranscriptionRequest
+        var attempt = 0;
+        while (!_cts.IsCancellationRequested)
         {
-            LanguageCode = LanguageCode.EnUS,
-            MediaEncoding = MediaEncoding.Pcm,
-            MediaSampleRateHertz = 16000,
-            ShowSpeakerLabel = false,
-            EnablePartialResultsStabilization = true,
-            // Medium balances latency vs. partial stability; High adds noticeable delay.
-            PartialResultsStability = PartialResultsStability.Medium,
-            AudioStreamPublisher = GetNextAudioEventAsync
-        };
-
-        try
-        {
-            using var response = await _client.StartStreamTranscriptionAsync(request, _cts.Token);
-            var resultStream = response.TranscriptResultStream;
-            resultStream.TranscriptEventReceived += (_, e) =>
+            attempt++;
+            using var client = new AmazonTranscribeStreamingClient(RegionEndpoint.GetBySystemName(_settings.AwsRegion));
+            var request = new StartStreamTranscriptionRequest
             {
-                if (e.EventStreamEvent is TranscriptEvent te)
-                {
-                    _ = HandleTranscriptAsync(te);
-                }
+                LanguageCode = LanguageCode.EnUS,
+                MediaEncoding = MediaEncoding.Pcm,
+                MediaSampleRateHertz = 16000,
+                ShowSpeakerLabel = false,
+                EnablePartialResultsStabilization = true,
+                PartialResultsStability = PartialResultsStability.Medium,
+                AudioStreamPublisher = GetNextAudioEventAsync
             };
-            resultStream.StartProcessing();
-            await Task.Delay(Timeout.Infinite, _cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // expected
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Transcribe session failed for participant {ParticipantId}.", _participantId);
+
+            try
+            {
+                if (attempt > 1)
+                {
+                    _logger.LogInformation(
+                        "Transcribe stream attempt {Attempt} for session {SessionKey}.",
+                        attempt,
+                        _participantId);
+                }
+
+                using var response = await client.StartStreamTranscriptionAsync(request, _cts.Token);
+                var resultStream = response.TranscriptResultStream;
+                resultStream.TranscriptEventReceived += (_, e) =>
+                {
+                    if (e.EventStreamEvent is TranscriptEvent te)
+                    {
+                        _ = HandleTranscriptAsync(te);
+                    }
+                };
+                resultStream.StartProcessing();
+                await Task.Delay(Timeout.Infinite, _cts.Token);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Transcribe stream ended for session {SessionKey}; will retry if call continues.", _participantId);
+                try
+                {
+                    var delay = Math.Min(5000, 250 * attempt);
+                    await Task.Delay(delay, _cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
         }
     }
 
@@ -275,12 +311,17 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 continue;
             }
 
-            if (string.Equals(_lastFinal, text, StringComparison.Ordinal))
+            var start = (double)(result.StartTime ?? 0);
+            var end = (double)(result.EndTime ?? 0);
+            var dedupeKey =
+                start.ToString("F6", CultureInfo.InvariantCulture) + "|" +
+                end.ToString("F6", CultureInfo.InvariantCulture) + "|" + text;
+            if (string.Equals(_lastFinalDedupeKey, dedupeKey, StringComparison.Ordinal))
             {
                 continue;
             }
 
-            _lastFinal = text;
+            _lastFinalDedupeKey = dedupeKey;
             _logger.LogInformation("Transcript mapped to {ParticipantName}: {Text}", displayName, text);
             await _transcriptBroadcaster.BroadcastAsync(
                 "Final",
@@ -325,10 +366,16 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         _cts.Cancel();
         if (_sessionTask is not null)
         {
-            await _sessionTask;
+            try
+            {
+                await _sessionTask;
+            }
+            catch
+            {
+                // faulted task on shutdown is ok
+            }
         }
 
-        _client.Dispose();
         _cts.Dispose();
         _audioSignal.Dispose();
     }
