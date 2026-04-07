@@ -13,6 +13,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
 {
     private readonly BotSettings _settings;
     private readonly TranscriptAggregator _aggregator;
+    private readonly MeetingParticipantService _meetingParticipants;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TranscriptionManager> _logger;
     private readonly ConcurrentDictionary<uint, TranscribeStreamService> _streamsBySourceId = new();
@@ -26,11 +27,13 @@ public sealed class TranscriptionManager : IAsyncDisposable
     public TranscriptionManager(
         BotSettings settings,
         TranscriptAggregator aggregator,
+        MeetingParticipantService meetingParticipants,
         ILoggerFactory loggerFactory,
         ILogger<TranscriptionManager> logger)
     {
         _settings = settings;
         _aggregator = aggregator;
+        _meetingParticipants = meetingParticipants;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -68,6 +71,18 @@ public sealed class TranscriptionManager : IAsyncDisposable
 
         if (!_participantBySourceId.TryGetValue(sourceId, out var participant))
         {
+            if (TryResolveFromSingleRosterParticipant(sourceId, out participant))
+            {
+                _participantBySourceId[sourceId] = participant;
+                _unresolvedSourceIds.TryRemove(sourceId, out _);
+                _logger.LogWarning(
+                    "Applied single-participant fallback mapping sourceId {SourceId} -> {DisplayName} ({UserId}).",
+                    sourceId,
+                    participant.DisplayName,
+                    participant.UserId);
+            }
+            else
+            {
             if (_unresolvedSourceIds.TryAdd(sourceId, 0))
             {
                 _logger.LogWarning(
@@ -77,6 +92,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
 
             _ = RefreshMappingsFromRosterAsync();
             return;
+            }
         }
 
         var stream = _streamsBySourceId.GetOrAdd(sourceId, _ =>
@@ -351,6 +367,20 @@ public sealed class TranscriptionManager : IAsyncDisposable
         {
             _refreshLock.Release();
         }
+    }
+
+    private bool TryResolveFromSingleRosterParticipant(uint sourceId, out ParticipantIdentity participant)
+    {
+        var roster = _meetingParticipants.GetRosterSnapshot();
+        if (roster.Count == 1)
+        {
+            var single = roster[0];
+            participant = new ParticipantIdentity(single.AzureAdObjectId, single.DisplayName);
+            return true;
+        }
+
+        participant = default!;
+        return false;
     }
 
     public async ValueTask DisposeAsync()

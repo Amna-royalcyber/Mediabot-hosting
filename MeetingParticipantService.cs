@@ -97,6 +97,20 @@ public sealed class MeetingParticipantService
         return null;
     }
 
+    public IReadOnlyList<RosterParticipantDto> GetRosterSnapshot()
+    {
+        lock (_lock)
+        {
+            return _rosterOrder
+                .Select(e => new RosterParticipantDto(
+                    e.CallParticipantId,
+                    e.DisplayName,
+                    e.AzureAdObjectId,
+                    e.UserPrincipalName))
+                .ToList();
+        }
+    }
+
     private void IngestParticipant(IParticipant participant, string botClientId)
     {
         var resource = participant.Resource;

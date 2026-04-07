@@ -9,15 +9,15 @@ namespace TeamsMediaBot;
 public sealed class MediaHandler
 {
     private readonly ILogger<MediaHandler> _logger;
-    private readonly ParticipantAudioStreamHandler _participantAudioStreamHandler;
+    private readonly ParticipantAudioRouter _participantAudioRouter;
     private IAudioSocket? _audioSocket;
 
     public MediaHandler(
         ILogger<MediaHandler> logger,
-        ParticipantAudioStreamHandler participantAudioStreamHandler)
+        ParticipantAudioRouter participantAudioRouter)
     {
         _logger = logger;
-        _participantAudioStreamHandler = participantAudioStreamHandler;
+        _participantAudioRouter = participantAudioRouter;
     }
 
     public IMediaSession CreateMediaSession(ICommunicationsClient communicationsClient)
@@ -52,7 +52,7 @@ public sealed class MediaHandler
     {
         try
         {
-            await _participantAudioStreamHandler.HandleAsync(args);
+            await _participantAudioRouter.HandleAudioAsync(args);
         }
         catch (Exception ex)
         {
