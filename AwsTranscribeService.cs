@@ -132,6 +132,11 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
     private string? _lastFinalDedupeKey;
     private DateTime _lastPartialUtc = DateTime.MinValue;
 
+    /// <summary>Last time real (non-keepalive) PCM arrived from Teams. AWS streaming can stall if no audio for several seconds.</summary>
+    private DateTime _lastRealAudioUtc;
+
+    private Timer? _silenceKeepAliveTimer;
+
     public ParticipantTranscribeSession(
         BotSettings settings,
         string participantId,
@@ -145,6 +150,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         _transcriptBroadcaster = transcriptBroadcaster;
         _logger = logger;
         _broadcastPartials = settings.TranscriptBroadcastPartials;
+        _lastRealAudioUtc = DateTime.UtcNow;
     }
 
     public void UpdateDisplayName(string displayName)
@@ -182,6 +188,15 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             }
 
             _sessionTask = RunSessionLoopAsync();
+
+            if (_silenceKeepAliveTimer is null)
+            {
+                _silenceKeepAliveTimer = new Timer(
+                    EnqueueSilenceKeepAliveIfNeeded,
+                    null,
+                    dueTime: TimeSpan.FromSeconds(4),
+                    period: TimeSpan.FromSeconds(4));
+            }
         }
 
         return Task.CompletedTask;
@@ -189,8 +204,34 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
     public void EnqueueAudio(byte[] pcmAudio, long _)
     {
+        _lastRealAudioUtc = DateTime.UtcNow;
         _audioQueue.Enqueue(pcmAudio);
         _audioSignal.Release();
+    }
+
+    private void EnqueueSilenceKeepAliveIfNeeded(object? _)
+    {
+        if (_cts.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            if ((DateTime.UtcNow - _lastRealAudioUtc).TotalSeconds < 3.5)
+            {
+                return;
+            }
+
+            var chunkMs = Math.Clamp(_settings.TranscribeAudioChunkMilliseconds, 50, 500);
+            var bytes = 16_000 * 2 * chunkMs / 1000;
+            _audioQueue.Enqueue(new byte[bytes]);
+            _audioSignal.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // shutting down
+        }
     }
 
     /// <summary>Retries the streaming connection after errors so speech works again after silence or transient AWS failures.</summary>
@@ -224,6 +265,10 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
                 using var response = await client.StartStreamTranscriptionAsync(request, _cts.Token);
                 var resultStream = response.TranscriptResultStream;
+                resultStream.ExceptionReceived += (_, ev) =>
+                {
+                    _logger.LogError(ev.EventStreamException, "Transcribe result stream exception for session {SessionKey}.", _participantId);
+                };
                 resultStream.TranscriptEventReceived += (_, e) =>
                 {
                     if (e.EventStreamEvent is TranscriptEvent te)
@@ -363,6 +408,8 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _silenceKeepAliveTimer?.Dispose();
+        _silenceKeepAliveTimer = null;
         _cts.Cancel();
         if (_sessionTask is not null)
         {

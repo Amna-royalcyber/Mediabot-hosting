@@ -30,6 +30,9 @@ public sealed class TranscribeStreamService : IAsyncDisposable
     private string? _lastPartialTranscript;
     private DateTime _lastPartialSentAtUtc = DateTime.MinValue;
 
+    private DateTime _lastRealAudioUtc;
+    private Timer? _silenceKeepAliveTimer;
+
     public TranscribeStreamService(
         BotSettings settings,
         TranscriptAggregator aggregator,
@@ -41,6 +44,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         _participant = participant;
         _logger = logger;
         _broadcastPartials = settings.TranscriptBroadcastPartials;
+        _lastRealAudioUtc = DateTime.UtcNow;
     }
 
     public void UpdateParticipant(ParticipantIdentity participant)
@@ -61,6 +65,15 @@ public sealed class TranscribeStreamService : IAsyncDisposable
             }
 
             _sessionTask = RunSessionLoopAsync();
+
+            if (_silenceKeepAliveTimer is null)
+            {
+                _silenceKeepAliveTimer = new Timer(
+                    EnqueueSilenceKeepAliveIfNeeded,
+                    null,
+                    dueTime: TimeSpan.FromSeconds(4),
+                    period: TimeSpan.FromSeconds(4));
+            }
         }
 
         return Task.CompletedTask;
@@ -73,8 +86,33 @@ public sealed class TranscribeStreamService : IAsyncDisposable
             return;
         }
 
+        _lastRealAudioUtc = DateTime.UtcNow;
         _audioQueue.Enqueue((pcm16kMono, timestamp));
         _signal.Release();
+    }
+
+    private void EnqueueSilenceKeepAliveIfNeeded(object? _)
+    {
+        if (_cts.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            if ((DateTime.UtcNow - _lastRealAudioUtc).TotalSeconds < 3.5)
+            {
+                return;
+            }
+
+            var chunkMs = Math.Clamp(_settings.TranscribeAudioChunkMilliseconds, 50, 500);
+            var bytes = 16_000 * 2 * chunkMs / 1000;
+            _audioQueue.Enqueue((new byte[bytes], 0L));
+            _signal.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     private async Task RunSessionLoopAsync()
@@ -99,6 +137,10 @@ public sealed class TranscribeStreamService : IAsyncDisposable
             {
                 using var res = await client.StartStreamTranscriptionAsync(req, _cts.Token);
                 var stream = res.TranscriptResultStream;
+                stream.ExceptionReceived += (_, ev) =>
+                {
+                    _logger.LogError(ev.EventStreamException, "Transcribe result stream exception for {UserId}.", _participant.UserId);
+                };
                 stream.TranscriptEventReceived += (_, e) =>
                 {
                     if (e.EventStreamEvent is TranscriptEvent te)
@@ -239,6 +281,8 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _silenceKeepAliveTimer?.Dispose();
+        _silenceKeepAliveTimer = null;
         _cts.Cancel();
         if (_sessionTask is not null)
         {

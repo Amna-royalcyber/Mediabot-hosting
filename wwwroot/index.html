@@ -73,6 +73,9 @@
     });
 
     connection.on("transcript", (message) => {
+      if (message.kind !== "Final") {
+        return;
+      }
       const line = document.createElement("div");
       line.className = `line ${message.kind === "Final" ? "final" : "partial"}`;
       let label = message.speakerLabel != null && String(message.speakerLabel).trim() !== ""
