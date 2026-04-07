@@ -14,13 +14,19 @@ public sealed class CallHandler
 {
     private readonly BotSettings _settings;
     private readonly MeetingParticipantService _meetingParticipants;
+    private readonly TranscriptionManager _transcriptionManager;
     private readonly ILogger<CallHandler> _logger;
     private ICommunicationsClient? _communicationsClient;
 
-    public CallHandler(BotSettings settings, MeetingParticipantService meetingParticipants, ILogger<CallHandler> logger)
+    public CallHandler(
+        BotSettings settings,
+        MeetingParticipantService meetingParticipants,
+        TranscriptionManager transcriptionManager,
+        ILogger<CallHandler> logger)
     {
         _settings = settings;
         _meetingParticipants = meetingParticipants;
+        _transcriptionManager = transcriptionManager;
         _logger = logger;
     }
 
@@ -168,11 +174,12 @@ public sealed class CallHandler
             if (r?.State?.ToString() == "Established")
             {
                 _logger.LogInformation(
-                    "Call established. MediaHandler will log PCM when mixed audio is available (unmute participants and speak — silence may produce few or no frames).");
+                    "Call established. MediaHandler is receiving unmixed participant audio; speaking participants should produce per-source audio frames.");
             }
         };
 
         _meetingParticipants.AttachToCall(call, _settings.ClientId);
+        _transcriptionManager.AttachToCall(call, _settings.ClientId);
 
         _logger.LogInformation("Join request submitted. Call ID: {CallId}, ScenarioId={ScenarioId}", call.Id, scenarioId);
         return call;
