@@ -55,9 +55,14 @@ public static class Program
             TranscriptBroadcastPartials = ReadBool(builder.Configuration, "BOT_TRANSCRIPT_BROADCAST_PARTIALS", "Bot:TranscriptBroadcastPartials", defaultValue: false),
             TranscribeAudioChunkMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIBE_CHUNK_MS", "Bot:TranscribeAudioChunkMilliseconds", 100),
             TranscribePartialMinIntervalMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIBE_PARTIAL_MS", "Bot:TranscribePartialMinIntervalMilliseconds", 90),
-            TranscriptTimelineMergeMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIPT_TIMELINE_MS", "Bot:TranscriptTimelineMergeMilliseconds", 20)
+            TranscriptTimelineMergeMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIPT_TIMELINE_MS", "Bot:TranscriptTimelineMergeMilliseconds", 20),
+            TranscriptAlbEndpoint = ReadOptional(builder.Configuration, "BOT_TRANSCRIPT_ALB_ENDPOINT", "Bot:TranscriptAlbEndpoint")
         });
 
+        builder.Services.AddHttpClient("AlbTranscriptSender");
+        builder.Services.AddSingleton<MeetingContextStore>();
+        builder.Services.AddSingleton<TranscriptAlbSender>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAlbSender>());
         builder.Services.AddSingleton<TranscriptBroadcaster>();
         builder.Services.AddSingleton<TranscriptAggregator>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());

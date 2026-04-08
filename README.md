@@ -83,6 +83,7 @@ Values are read from **environment variables first**, then **`appsettings.json`*
 | `BOT_MEDIA_INSTANCE_PUBLIC_PORT` | `Media:InstancePublicPort` |
 | `BOT_MEDIA_SERVICE_FQDN` | `Media:ServiceFqdn` (**use when callback host ≠ cert name**) |
 | `AWS_REGION` | AWS region for Transcribe |
+| `BOT_TRANSCRIPT_ALB_ENDPOINT` | `Bot:TranscriptAlbEndpoint` (receives 3-minute transcript JSON batches) |
 
 ---
 

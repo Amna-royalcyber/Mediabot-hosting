@@ -58,6 +58,9 @@ public sealed class BotSettings
 
     /// <summary>Optional merge window when multiplexing multiple participants into one timeline (milliseconds).</summary>
     public int TranscriptTimelineMergeMilliseconds { get; init; } = 20;
+
+    /// <summary>Optional ALB endpoint that receives 3-minute transcript JSON payloads.</summary>
+    public string? TranscriptAlbEndpoint { get; init; }
 }
 
 public sealed class BotService
