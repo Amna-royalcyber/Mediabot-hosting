@@ -17,6 +17,8 @@ public sealed class CallHandler
     private readonly TranscriptionManager _transcriptionManager;
     private readonly ParticipantAudioRouter _participantAudioRouter;
     private readonly MeetingContextStore _meetingContext;
+    private readonly ParticipantManager _participantManager;
+    private readonly TranscriptionChunkManager _transcriptionChunkManager;
     private readonly ILogger<CallHandler> _logger;
     private ICommunicationsClient? _communicationsClient;
 
@@ -26,6 +28,8 @@ public sealed class CallHandler
         TranscriptionManager transcriptionManager,
         ParticipantAudioRouter participantAudioRouter,
         MeetingContextStore meetingContext,
+        ParticipantManager participantManager,
+        TranscriptionChunkManager transcriptionChunkManager,
         ILogger<CallHandler> logger)
     {
         _settings = settings;
@@ -33,6 +37,8 @@ public sealed class CallHandler
         _transcriptionManager = transcriptionManager;
         _participantAudioRouter = participantAudioRouter;
         _meetingContext = meetingContext;
+        _participantManager = participantManager;
+        _transcriptionChunkManager = transcriptionChunkManager;
         _logger = logger;
     }
 
@@ -179,11 +185,16 @@ public sealed class CallHandler
 
             if (r?.State?.ToString() == "Established")
             {
+                var established = DateTime.UtcNow;
+                _meetingContext.SetCallEstablishedUtc(established);
+                _transcriptionChunkManager.BeginMeeting(established);
                 _logger.LogInformation(
                     "Call established. MediaHandler is receiving unmixed participant audio; speaking participants should produce per-source audio frames.");
             }
         };
 
+        _transcriptionChunkManager.ResetForNewJoin();
+        _participantManager.BeginNewMeeting(call.Id);
         _meetingParticipants.AttachToCall(call, _settings.ClientId);
         _transcriptionManager.AttachToCall(call, _settings.ClientId);
         _participantAudioRouter.AttachToCall(call, _settings.ClientId);

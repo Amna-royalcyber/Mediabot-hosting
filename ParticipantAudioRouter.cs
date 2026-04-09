@@ -15,8 +15,8 @@ public sealed class ParticipantAudioRouter
     private readonly AudioProcessor _audioProcessor;
     private readonly AwsTranscribeService _awsTranscribeService;
     private readonly MeetingParticipantService _meetingParticipants;
+    private readonly ParticipantManager _participantManager;
     private readonly ILogger<ParticipantAudioRouter> _logger;
-    private readonly ConcurrentDictionary<uint, ParticipantAudioBinding> _bindingBySourceId = new();
 
     /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
     private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
@@ -36,11 +36,13 @@ public sealed class ParticipantAudioRouter
         AudioProcessor audioProcessor,
         AwsTranscribeService awsTranscribeService,
         MeetingParticipantService meetingParticipants,
+        ParticipantManager participantManager,
         ILogger<ParticipantAudioRouter> logger)
     {
         _audioProcessor = audioProcessor;
         _awsTranscribeService = awsTranscribeService;
         _meetingParticipants = meetingParticipants;
+        _participantManager = participantManager;
         _logger = logger;
     }
 
@@ -104,10 +106,10 @@ public sealed class ParticipantAudioRouter
                 continue;
             }
 
-            if (!_bindingBySourceId.TryGetValue(sourceId, out var binding))
+            if (!_participantManager.TryResolveAudioSource(sourceId, out var participantId, out var displayName))
             {
                 var roster = _meetingParticipants.GetRosterSnapshot();
-                if (!TryInferBindingForUnmappedSource(sourceId, roster, out binding))
+                if (!TryInferBindingForUnmappedSource(sourceId, roster, out participantId, out displayName))
                 {
                     LogUnmappedSourceIdOnce(sourceId);
                     continue;
@@ -131,10 +133,10 @@ public sealed class ParticipantAudioRouter
                 continue;
             }
 
-            _logger.LogDebug("Audio received from {ParticipantName} ({ParticipantId}).", binding.DisplayName, binding.ParticipantId);
+            _logger.LogDebug("Audio received from {ParticipantName} ({ParticipantId}).", displayName, participantId);
             await _awsTranscribeService.SendAudioChunkAsync(
-                binding.ParticipantId,
-                binding.DisplayName,
+                participantId,
+                displayName,
                 pcm,
                 ub.OriginalSenderTimestamp);
         }
@@ -172,7 +174,7 @@ public sealed class ParticipantAudioRouter
             return;
         }
 
-        if (!TryResolveMixedAttribution(roster, out var binding))
+        if (!TryResolveMixedAttribution(roster, out var mixedParticipantId, out var mixedDisplayName))
         {
             return;
         }
@@ -185,8 +187,8 @@ public sealed class ParticipantAudioRouter
         }
 
         await _awsTranscribeService.SendMixedDominantAudioAsync(
-            binding.ParticipantId,
-            binding.DisplayName,
+            mixedParticipantId,
+            mixedDisplayName,
             pcm,
             args.Buffer.Timestamp);
     }
@@ -204,20 +206,19 @@ public sealed class ParticipantAudioRouter
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
         IReadOnlyList<RosterParticipantDto> roster,
-        out ParticipantAudioBinding binding)
+        out string participantId,
+        out string displayName)
     {
-        binding = default!;
+        participantId = string.Empty;
+        displayName = string.Empty;
         lock (_inferLock)
         {
-            if (_bindingBySourceId.TryGetValue(sourceId, out var race))
+            if (_participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName))
             {
-                binding = race;
                 return true;
             }
 
-            var mappedUserIds = new HashSet<string>(
-                _bindingBySourceId.Values.Select(v => v.ParticipantId),
-                StringComparer.OrdinalIgnoreCase);
+            var mappedUserIds = _participantManager.GetParticipantIdsWithAudioSourceBindings();
 
             var unmappedHumans = roster
                 .Where(r => !mappedUserIds.Contains(r.AzureAdObjectId))
@@ -231,14 +232,13 @@ public sealed class ParticipantAudioRouter
             if (unmappedHumans.Count == 1)
             {
                 var p = unmappedHumans[0];
-                binding = new ParticipantAudioBinding(p.AzureAdObjectId, p.DisplayName);
-                _bindingBySourceId[sourceId] = binding;
-                _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
+                _participantManager.TryBindAudioSource(sourceId, p.AzureAdObjectId, p.DisplayName, "InferenceSingleRoster");
+                _awsTranscribeService.UpsertParticipant(p.AzureAdObjectId, p.DisplayName);
                 _logger.LogInformation(
                     "Inferred sourceId {SourceId} → {DisplayName} (only roster user without a Graph mediaStreams sourceId).",
                     sourceId,
-                    binding.DisplayName);
-                return true;
+                    p.DisplayName);
+                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
             }
 
             if (!_sourceIdDiscoveryOrder.Contains(sourceId))
@@ -255,9 +255,8 @@ public sealed class ParticipantAudioRouter
 
             idx = Math.Min(idx, sorted.Count - 1);
             var pick = sorted[idx];
-            binding = new ParticipantAudioBinding(pick.AzureAdObjectId, pick.DisplayName);
-            _bindingBySourceId[sourceId] = binding;
-            _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
+            _participantManager.TryBindAudioSource(sourceId, pick.AzureAdObjectId, pick.DisplayName, "InferenceHeuristic");
+            _awsTranscribeService.UpsertParticipant(pick.AzureAdObjectId, pick.DisplayName);
             if (Interlocked.Increment(ref _loggedHeuristicMultiInference) == 1)
             {
                 _logger.LogWarning(
@@ -267,9 +266,9 @@ public sealed class ParticipantAudioRouter
             _logger.LogDebug(
                 "Inferred sourceId {SourceId} → {DisplayName} (heuristic index {Idx}).",
                 sourceId,
-                binding.DisplayName,
+                pick.DisplayName,
                 idx);
-            return true;
+            return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
         }
     }
 
@@ -283,21 +282,27 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    private bool TryResolveMixedAttribution(IReadOnlyList<RosterParticipantDto> roster, out ParticipantAudioBinding binding)
+    private bool TryResolveMixedAttribution(IReadOnlyList<RosterParticipantDto> roster, out string participantId, out string displayName)
     {
-        binding = default!;
+        participantId = string.Empty;
+        displayName = string.Empty;
         var none = (uint)DominantSpeakerChangedEventArgs.None;
         var dom = _dominantSourceId;
 
-        if (dom != none && _bindingBySourceId.TryGetValue(dom, out var mapped))
+        if (dom != none && _participantManager.TryResolveAudioSource(dom, out participantId, out displayName))
         {
-            binding = mapped;
             return true;
+        }
+
+        if (roster.Count == 0)
+        {
+            return false;
         }
 
         if (roster.Count == 1)
         {
-            binding = new ParticipantAudioBinding(roster[0].AzureAdObjectId, roster[0].DisplayName);
+            participantId = roster[0].AzureAdObjectId;
+            displayName = roster[0].DisplayName;
             return true;
         }
 
@@ -312,7 +317,8 @@ public sealed class ParticipantAudioRouter
                     dom);
             }
 
-            binding = new ParticipantAudioBinding(roster[0].AzureAdObjectId, roster[0].DisplayName);
+            participantId = roster[0].AzureAdObjectId;
+            displayName = roster[0].DisplayName;
             return true;
         }
 
@@ -323,7 +329,8 @@ public sealed class ParticipantAudioRouter
                 roster[0].DisplayName);
         }
 
-        binding = new ParticipantAudioBinding(roster[0].AzureAdObjectId, roster[0].DisplayName);
+        participantId = roster[0].AzureAdObjectId;
+        displayName = roster[0].DisplayName;
         return true;
     }
 
@@ -350,13 +357,17 @@ public sealed class ParticipantAudioRouter
             displayName = participantId;
         }
 
+        var pid = participantId.Trim();
+        var dn = displayName.Trim();
+        _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
+
         foreach (var sourceId in TryExtractSourceIds(resource))
         {
-            var binding = new ParticipantAudioBinding(participantId.Trim(), displayName.Trim());
-            _bindingBySourceId[sourceId] = binding;
-            _awsTranscribeService.UpsertParticipant(binding.ParticipantId, binding.DisplayName);
-            _logger.LogInformation("Bound sourceId {SourceId} -> {DisplayName} ({ParticipantId}).", sourceId, binding.DisplayName, binding.ParticipantId);
+            _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
+            _logger.LogInformation("Bound sourceId {SourceId} -> {DisplayName} ({ParticipantId}).", sourceId, dn, pid);
         }
+
+        _awsTranscribeService.UpsertParticipant(pid, dn);
     }
 
     private void RemoveParticipantMappings(IParticipant participant)
@@ -365,11 +376,6 @@ public sealed class ParticipantAudioRouter
         if (string.IsNullOrWhiteSpace(participantId))
         {
             return;
-        }
-
-        foreach (var kvp in _bindingBySourceId.Where(k => string.Equals(k.Value.ParticipantId, participantId.Trim(), StringComparison.OrdinalIgnoreCase)).ToList())
-        {
-            _bindingBySourceId.TryRemove(kvp.Key, out _);
         }
 
         _awsTranscribeService.RemoveParticipant(participantId.Trim());
@@ -490,5 +496,4 @@ public sealed class ParticipantAudioRouter
         return bytes;
     }
 
-    private sealed record ParticipantAudioBinding(string ParticipantId, string DisplayName);
 }

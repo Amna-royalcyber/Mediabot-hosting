@@ -46,7 +46,8 @@ public sealed class MediaHandler
             _logger.LogDebug("Dominant speaker source id (MSI) set to {SourceId}", sid);
         };
 
-        _logger.LogInformation("Media session initialized with unmixed meeting audio.");
+        _logger.LogInformation(
+            "Media session initialized with unmixed meeting audio. Speaker labels use immutable Teams source-id → Entra bindings (ParticipantManager).");
         return mediaSession;
     }
 

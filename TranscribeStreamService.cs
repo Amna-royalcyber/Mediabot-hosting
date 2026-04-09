@@ -221,6 +221,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                 _lastPartialSentAtUtc = now;
                 await _aggregator.PublishAsync(new TranscriptFragment(
                     AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
+                    EmittedAtUtc: DateTime.UtcNow,
                     Kind: "Partial",
                     Text: text,
                     UserId: participant.UserId,
@@ -242,6 +243,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 
             await _aggregator.PublishAsync(new TranscriptFragment(
                 AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
+                EmittedAtUtc: DateTime.UtcNow,
                 Kind: "Final",
                 Text: text,
                 UserId: participant.UserId,

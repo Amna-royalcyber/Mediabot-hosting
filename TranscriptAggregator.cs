@@ -6,6 +6,7 @@ namespace TeamsMediaBot;
 
 public sealed record TranscriptFragment(
     long AudioTimestamp,
+    DateTime EmittedAtUtc,
     string Kind,
     string Text,
     string UserId,
@@ -18,7 +19,6 @@ public sealed class TranscriptAggregator : BackgroundService
 {
     private readonly BotSettings _settings;
     private readonly TranscriptBroadcaster _broadcaster;
-    private readonly TranscriptAlbSender _albSender;
     private readonly ILogger<TranscriptAggregator> _logger;
     private readonly Channel<TranscriptFragment> _incoming = Channel.CreateUnbounded<TranscriptFragment>();
     private readonly PriorityQueue<TranscriptFragment, long> _timeline = new();
@@ -27,12 +27,10 @@ public sealed class TranscriptAggregator : BackgroundService
     public TranscriptAggregator(
         BotSettings settings,
         TranscriptBroadcaster broadcaster,
-        TranscriptAlbSender albSender,
         ILogger<TranscriptAggregator> logger)
     {
         _settings = settings;
         _broadcaster = broadcaster;
-        _albSender = albSender;
         _logger = logger;
     }
 
@@ -77,9 +75,10 @@ public sealed class TranscriptAggregator : BackgroundService
             await _broadcaster.BroadcastAsync(
                 item.Kind,
                 item.Text,
+                item.EmittedAtUtc,
+                item.AudioTimestamp,
                 speakerLabel: item.DisplayName,
                 azureAdObjectId: item.UserId);
-            _albSender.Enqueue(item);
         }
     }
 }

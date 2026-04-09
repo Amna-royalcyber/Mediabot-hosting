@@ -64,8 +64,9 @@ public static class Program
             client.Timeout = TimeSpan.FromSeconds(15);
         });
         builder.Services.AddSingleton<MeetingContextStore>();
-        builder.Services.AddSingleton<TranscriptAlbSender>();
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAlbSender>());
+        builder.Services.AddSingleton<ParticipantManager>();
+        builder.Services.AddSingleton<TranscriptionChunkManager>();
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptionChunkManager>());
         builder.Services.AddSingleton<TranscriptBroadcaster>();
         builder.Services.AddSingleton<TranscriptAggregator>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());
