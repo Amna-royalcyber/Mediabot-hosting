@@ -17,7 +17,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     public const string DominantMixedSessionKey = "__dominant_mixed__";
 
     private readonly BotSettings _settings;
-    private readonly TranscriptBroadcaster _transcriptBroadcaster;
+    private readonly TranscriptAggregator _transcriptAggregator;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<AwsTranscribeService> _logger;
     private readonly ConcurrentDictionary<string, ParticipantTranscribeSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
@@ -25,12 +25,12 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
     public AwsTranscribeService(
         BotSettings settings,
-        TranscriptBroadcaster transcriptBroadcaster,
+        TranscriptAggregator transcriptAggregator,
         ILoggerFactory loggerFactory,
         ILogger<AwsTranscribeService> logger)
     {
         _settings = settings;
-        _transcriptBroadcaster = transcriptBroadcaster;
+        _transcriptAggregator = transcriptAggregator;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -58,7 +58,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 _settings,
                 participantId,
                 displayName,
-                _transcriptBroadcaster,
+                _transcriptAggregator,
                 _loggerFactory.CreateLogger<ParticipantTranscribeSession>()));
 
         await session.EnsureStartedAsync();
@@ -84,7 +84,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 _settings,
                 DominantMixedSessionKey,
                 displayName,
-                _transcriptBroadcaster,
+                _transcriptAggregator,
                 _loggerFactory.CreateLogger<ParticipantTranscribeSession>()));
 
         session.UpdateTranscriptIdentity(participantId, displayName);
@@ -115,7 +115,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 {
     private readonly BotSettings _settings;
-    private readonly TranscriptBroadcaster _transcriptBroadcaster;
+    private readonly TranscriptAggregator _transcriptAggregator;
     private readonly ILogger<ParticipantTranscribeSession> _logger;
     private readonly bool _broadcastPartials;
     private string _participantId;
@@ -141,13 +141,13 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         BotSettings settings,
         string participantId,
         string displayName,
-        TranscriptBroadcaster transcriptBroadcaster,
+        TranscriptAggregator transcriptAggregator,
         ILogger<ParticipantTranscribeSession> logger)
     {
         _settings = settings;
         _participantId = participantId;
         _displayName = displayName;
-        _transcriptBroadcaster = transcriptBroadcaster;
+        _transcriptAggregator = transcriptAggregator;
         _logger = logger;
         _broadcastPartials = settings.TranscriptBroadcastPartials;
         _lastRealAudioUtc = DateTime.UtcNow;
@@ -348,11 +348,12 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
                 _lastPartial = text;
                 _lastPartialUtc = DateTime.UtcNow;
-                await _transcriptBroadcaster.BroadcastAsync(
-                    "Partial",
-                    text,
-                    speakerLabel: displayName,
-                    azureAdObjectId: participantIdForBroadcast);
+                await _transcriptAggregator.PublishAsync(new TranscriptFragment(
+                    AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
+                    Kind: "Partial",
+                    Text: text,
+                    UserId: participantIdForBroadcast,
+                    DisplayName: displayName));
                 continue;
             }
 
@@ -368,11 +369,12 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
             _lastFinalDedupeKey = dedupeKey;
             _logger.LogInformation("Transcript mapped to {ParticipantName}: {Text}", displayName, text);
-            await _transcriptBroadcaster.BroadcastAsync(
-                "Final",
-                text,
-                speakerLabel: displayName,
-                azureAdObjectId: participantIdForBroadcast);
+            await _transcriptAggregator.PublishAsync(new TranscriptFragment(
+                AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
+                Kind: "Final",
+                Text: text,
+                UserId: participantIdForBroadcast,
+                DisplayName: displayName));
         }
     }
 
