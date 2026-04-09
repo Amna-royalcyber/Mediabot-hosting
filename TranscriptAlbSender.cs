@@ -68,7 +68,12 @@ public sealed class TranscriptAlbSender : BackgroundService
         List<TranscriptLine> snapshot;
         lock (_historyLock)
         {
-            if (!string.Equals(_historyMeetingId, meetingId, StringComparison.Ordinal))
+            // First flush for a meeting should not clear already collected transcript lines.
+            if (string.Equals(_historyMeetingId, "unknown", StringComparison.Ordinal))
+            {
+                _historyMeetingId = meetingId;
+            }
+            else if (!string.Equals(_historyMeetingId, meetingId, StringComparison.Ordinal))
             {
                 _historyMeetingId = meetingId;
                 _history.Clear();
