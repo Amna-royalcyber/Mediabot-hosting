@@ -77,6 +77,12 @@ public sealed class TranscriptAlbSender : BackgroundService
         try
         {
             var client = _httpClientFactory.CreateClient("AlbTranscriptSender");
+            _logger.LogInformation(
+                "Posting transcript batch to ALB endpoint {Endpoint}. MeetingId={MeetingId}, TranscriptCount={Count}, Flag={Flag}.",
+                _settings.TranscriptAlbEndpoint,
+                payload.meeting_id,
+                lines.Count,
+                payload.flag);
             using var request = new HttpRequestMessage(HttpMethod.Post, _settings.TranscriptAlbEndpoint)
             {
                 Content = JsonContent.Create(payload)

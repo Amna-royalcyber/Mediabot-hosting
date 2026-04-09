@@ -59,7 +59,10 @@ public static class Program
             TranscriptAlbEndpoint = ReadOptional(builder.Configuration, "BOT_TRANSCRIPT_ALB_ENDPOINT", "Bot:TranscriptAlbEndpoint")
         });
 
-        builder.Services.AddHttpClient("AlbTranscriptSender");
+        builder.Services.AddHttpClient("AlbTranscriptSender", client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(15);
+        });
         builder.Services.AddSingleton<MeetingContextStore>();
         builder.Services.AddSingleton<TranscriptAlbSender>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAlbSender>());
