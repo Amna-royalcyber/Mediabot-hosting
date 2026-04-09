@@ -12,7 +12,9 @@ public sealed class TranscriptAlbSender : BackgroundService
     private readonly MeetingContextStore _meetingContext;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<TranscriptAlbSender> _logger;
-    private readonly ConcurrentQueue<TranscriptLine> _pending = new();
+    private readonly List<TranscriptLine> _history = new();
+    private readonly object _historyLock = new();
+    private string _historyMeetingId = "unknown";
 
     public TranscriptAlbSender(
         BotSettings settings,
@@ -39,7 +41,10 @@ public sealed class TranscriptAlbSender : BackgroundService
             return;
         }
 
-        _pending.Enqueue(new TranscriptLine(fragment.DisplayName.Trim(), fragment.Text.Trim()));
+        lock (_historyLock)
+        {
+            _history.Add(new TranscriptLine(fragment.DisplayName.Trim(), fragment.Text.Trim()));
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -59,18 +64,28 @@ public sealed class TranscriptAlbSender : BackgroundService
 
     private async Task FlushAsync(CancellationToken cancellationToken)
     {
-        var lines = new List<Dictionary<string, string>>();
-        while (_pending.TryDequeue(out var line))
+        var meetingId = _meetingContext.CurrentMeetingId;
+        List<TranscriptLine> snapshot;
+        lock (_historyLock)
         {
-            lines.Add(new Dictionary<string, string>(StringComparer.Ordinal)
+            if (!string.Equals(_historyMeetingId, meetingId, StringComparison.Ordinal))
             {
-                [line.Name] = line.Text
-            });
+                _historyMeetingId = meetingId;
+                _history.Clear();
+            }
+
+            snapshot = _history.ToList();
+        }
+
+        var lines = new List<Dictionary<string, string>>(snapshot.Count);
+        foreach (var line in snapshot)
+        {
+            lines.Add(new Dictionary<string, string>(StringComparer.Ordinal) { [line.Name] = line.Text });
         }
 
         var hasTranscript = lines.Count > 0;
         var payload = new TranscriptAlbPayload(
-            meeting_id: _meetingContext.CurrentMeetingId,
+            meeting_id: meetingId,
             transcript: lines,
             flag: hasTranscript ? "length_limit_reached - 0" : "long_times_of_silence - 1");
 
