@@ -10,6 +10,10 @@ namespace TeamsMediaBot;
 public sealed class TranscriptItem
 {
     public required DateTime Timestamp { get; init; }
+
+    /// <summary>Entra object id (GUID) when resolved; otherwise synthetic e.g. <c>msi-pending-{sourceId}</c>.</summary>
+    public required string EntraObjectId { get; init; }
+
     public required string ParticipantName { get; init; }
     public required string Text { get; init; }
 }
@@ -167,6 +171,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
             _buffer.Add(new TranscriptItem
             {
                 Timestamp = utc,
+                EntraObjectId = participantId.Trim(),
                 ParticipantName = speakerName.Trim(),
                 Text = text.Trim()
             });
@@ -258,6 +263,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
             Transcript = ordered
                 .Select(i => new AlbTranscriptEntry
                 {
+                    EntraId = i.EntraObjectId,
                     Name = i.ParticipantName,
                     Text = i.Text
                 })
@@ -326,6 +332,9 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
     private sealed class AlbTranscriptEntry
     {
+        [JsonPropertyName("entra_id")]
+        public string EntraId { get; set; } = string.Empty;
+
         [JsonPropertyName("name")]
         public string Name { get; set; } = string.Empty;
 

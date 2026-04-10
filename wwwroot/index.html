@@ -49,51 +49,71 @@
 
     let lastRosterByAad = {};
 
+    function pick(obj, camel, pascal) {
+      if (obj == null) return undefined;
+      if (camel in obj && obj[camel] != null && obj[camel] !== "") return obj[camel];
+      if (pascal && pascal in obj && obj[pascal] != null && obj[pascal] !== "") return obj[pascal];
+      return undefined;
+    }
+
     connection.on("roster", (payload) => {
       lastRosterByAad = {};
-      const list = payload.participants || [];
+      const list = payload.participants || payload.Participants || [];
       if (list.length === 0) {
         rosterEl.hidden = true;
         rosterEl.textContent = "";
         return;
       }
       for (const p of list) {
-        if (p.azureAdObjectId) {
-          lastRosterByAad[p.azureAdObjectId] = p.displayName || p.userPrincipalName || p.id;
+        const oid = pick(p, "azureAdObjectId", "AzureAdObjectId");
+        if (oid) {
+          const dn = pick(p, "displayName", "DisplayName");
+          const upn = pick(p, "userPrincipalName", "UserPrincipalName");
+          const id = pick(p, "id", "Id");
+          lastRosterByAad[oid] = dn || upn || id || "";
         }
       }
       rosterEl.hidden = false;
       rosterEl.innerHTML = "<strong>In this meeting (Microsoft Entra)</strong> " +
         list.map((p) => {
-          const name = p.displayName || p.id || "";
-          const upn = p.userPrincipalName ? ` — ${p.userPrincipalName}` : "";
-          const oid = p.azureAdObjectId ? ` [object ID: ${p.azureAdObjectId}]` : "";
-          return `<span class="tag" title="${escapeHtml((p.userPrincipalName || "") + (p.azureAdObjectId || ""))}">${escapeHtml(name)}${escapeHtml(upn)}${escapeHtml(oid)}</span>`;
+          const name = pick(p, "displayName", "DisplayName") || pick(p, "id", "Id") || "";
+          const upnRaw = pick(p, "userPrincipalName", "UserPrincipalName");
+          const upn = upnRaw ? ` — ${upnRaw}` : "";
+          const oidRaw = pick(p, "azureAdObjectId", "AzureAdObjectId");
+          const oid = oidRaw ? ` [object ID: ${oidRaw}]` : "";
+          return `<span class="tag" title="${escapeHtml(String(upnRaw || "") + String(oidRaw || ""))}">${escapeHtml(name)}${escapeHtml(upn)}${escapeHtml(oid)}</span>`;
         }).join("");
     });
 
     connection.on("transcript", (message) => {
-      if (message.kind !== "Final") {
+      if (message == null) return;
+      const kindRaw = pick(message, "kind", "Kind");
+      const kind = kindRaw != null ? String(kindRaw) : "";
+      if (kind.toLowerCase() !== "final") {
+        return;
+      }
+      const text = pick(message, "text", "Text");
+      if (text == null || String(text).trim() === "") {
         return;
       }
       const line = document.createElement("div");
-      line.className = `line ${message.kind === "Final" ? "final" : "partial"}`;
-      let label = message.speakerLabel != null && String(message.speakerLabel).trim() !== ""
-        ? String(message.speakerLabel).trim()
-        : "";
-      if (label === "0") {
-        label = "";
+      line.className = "line final";
+      let label = "";
+      const sl = pick(message, "speakerLabel", "SpeakerLabel");
+      if (sl != null && String(sl).trim() !== "" && String(sl).trim() !== "0") {
+        label = String(sl).trim();
       }
-      if (!label && message.azureAdObjectId && lastRosterByAad[message.azureAdObjectId]) {
-        label = lastRosterByAad[message.azureAdObjectId];
+      const aad = pick(message, "azureAdObjectId", "AzureAdObjectId");
+      if (!label && aad && lastRosterByAad[aad]) {
+        label = lastRosterByAad[aad];
       }
       const who = label
         ? `<span class="speaker">${escapeHtml(label)}</span>`
         : "";
-      const oid = message.azureAdObjectId
-        ? ` <span class="aad-id" title="Azure AD object ID">${escapeHtml(message.azureAdObjectId)}</span>`
+      const oid = aad
+        ? ` <span class="aad-id" title="Microsoft Entra object ID">${escapeHtml(String(aad))}</span>`
         : "";
-      line.innerHTML = `${who}${escapeHtml(message.text || "")}${oid}`;
+      line.innerHTML = `${who}<span class="text">${escapeHtml(String(text))}</span>${oid}`;
       transcriptsEl.prepend(line);
     });
 
