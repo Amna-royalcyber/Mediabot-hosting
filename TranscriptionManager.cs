@@ -19,8 +19,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, TranscribeStreamService> _streamsBySourceId = new();
     private readonly ConcurrentDictionary<uint, ParticipantIdentity> _participantBySourceId = new();
     private readonly ConcurrentDictionary<string, List<uint>> _sourceIdsByUserId = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<uint, byte> _unresolvedSourceIds = new();
-    private readonly SemaphoreSlim _refreshLock = new(1, 1);
     private ICall? _attachedCall;
     private string? _botClientId;
 
@@ -71,27 +69,19 @@ public sealed class TranscriptionManager : IAsyncDisposable
 
         if (!_participantBySourceId.TryGetValue(sourceId, out var participant))
         {
-            if (TryResolveFromSingleRosterParticipant(sourceId, out participant))
+            var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
+            var syn = new ParticipantIdentity(syntheticId, $"Speaker ({sourceId})");
+            if (_participantBySourceId.TryAdd(sourceId, syn))
             {
-                _participantBySourceId[sourceId] = participant;
-                _unresolvedSourceIds.TryRemove(sourceId, out _);
-                _logger.LogWarning(
-                    "Applied single-participant fallback mapping sourceId {SourceId} -> {DisplayName} ({UserId}).",
+                participant = syn;
+                _logger.LogInformation(
+                    "Placeholder mapping sourceId {SourceId} -> {DisplayName} until Graph provides mediaStreams (no roster-based Entra guess).",
                     sourceId,
-                    participant.DisplayName,
-                    participant.UserId);
+                    participant.DisplayName);
             }
             else
             {
-            if (_unresolvedSourceIds.TryAdd(sourceId, 0))
-            {
-                _logger.LogWarning(
-                    "No participant mapping for sourceId {SourceId}. Audio will be ignored until mapped to an Entra user.",
-                    sourceId);
-            }
-
-            _ = RefreshMappingsFromRosterAsync();
-            return;
+                _participantBySourceId.TryGetValue(sourceId, out participant!);
             }
         }
 
@@ -149,7 +139,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
         foreach (var sourceId in sourceIds)
         {
             _participantBySourceId[sourceId] = identityRecord;
-            _unresolvedSourceIds.TryRemove(sourceId, out _);
             _logger.LogInformation(
                 "Mapped sourceId {SourceId} -> {DisplayName} ({UserId}).",
                 sourceId,
@@ -338,51 +327,6 @@ public sealed class TranscriptionManager : IAsyncDisposable
         }
     }
 
-    private async Task RefreshMappingsFromRosterAsync()
-    {
-        var call = _attachedCall;
-        var botClientId = _botClientId;
-        if (call is null || string.IsNullOrWhiteSpace(botClientId))
-        {
-            return;
-        }
-
-        if (!await _refreshLock.WaitAsync(0))
-        {
-            return;
-        }
-
-        try
-        {
-            foreach (var participant in call.Participants)
-            {
-                UpsertParticipantMappings(participant, botClientId);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "Roster refresh for source-id mapping failed.");
-        }
-        finally
-        {
-            _refreshLock.Release();
-        }
-    }
-
-    private bool TryResolveFromSingleRosterParticipant(uint sourceId, out ParticipantIdentity participant)
-    {
-        var roster = _meetingParticipants.GetRosterSnapshot();
-        if (roster.Count == 1)
-        {
-            var single = roster[0];
-            participant = new ParticipantIdentity(single.AzureAdObjectId, single.DisplayName);
-            return true;
-        }
-
-        participant = default!;
-        return false;
-    }
-
     public async ValueTask DisposeAsync()
     {
         foreach (var stream in _streamsBySourceId.Values)
@@ -391,6 +335,5 @@ public sealed class TranscriptionManager : IAsyncDisposable
         }
 
         _streamsBySourceId.Clear();
-        _refreshLock.Dispose();
     }
 }

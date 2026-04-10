@@ -193,8 +193,9 @@ public sealed class ParticipantAudioRouter
     }
 
     /// <summary>
-    /// When Graph omits <c>mediaStreams[].sourceId</c>, we only infer identity if exactly one human has no binding yet.
-    /// With two or more unmapped users, guessing (e.g. join order vs name sort) swaps speakers — we refuse and wait for Graph.
+    /// When Graph omits <c>mediaStreams[].sourceId</c> for a stream, we never map that MSI to a roster user by headcount
+    /// (e.g. "only one person in roster") — that mis-assigns the first packets before others join. Use a per-source placeholder;
+    /// <see cref="ParticipantManager.TryBindAudioSource"/> upgrades to Entra when Graph sends mediaStreams.
     /// </summary>
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
@@ -211,42 +212,17 @@ public sealed class ParticipantAudioRouter
                 return true;
             }
 
-            var mappedUserIds = _participantManager.GetParticipantIdsWithAudioSourceBindings();
-
-            var unmappedHumans = roster
-                .Where(r => !mappedUserIds.Contains(r.AzureAdObjectId))
-                .ToList();
-
-            if (unmappedHumans.Count == 0)
+            if (roster.Count == 0)
             {
                 return false;
             }
 
-            if (unmappedHumans.Count == 1)
-            {
-                var p = unmappedHumans[0];
-                var removed = _participantManager.TryBindAudioSource(sourceId, p.AzureAdObjectId, p.DisplayName, "InferenceSingleRoster");
-                if (removed is not null)
-                {
-                    _awsTranscribeService.RemoveParticipant(removed);
-                }
-
-                _awsTranscribeService.UpsertParticipant(p.AzureAdObjectId, p.DisplayName);
-                _logger.LogInformation(
-                    "Inferred sourceId {SourceId} → {DisplayName} (only roster user without a Graph mediaStreams sourceId).",
-                    sourceId,
-                    p.DisplayName);
-                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
-            }
-
-            // Multiple humans: use a non-Entra placeholder per source id (no cross-participant guessing). Graph can upgrade later.
             var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
             var syntheticName = $"Speaker ({sourceId})";
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
                 _logger.LogInformation(
-                    "Graph has not mapped mediaStreams source ids yet; using per-stream placeholders {Placeholder} until Entra mappings arrive.",
-                    syntheticName);
+                    "Graph has not mapped mediaStreams for some streams yet; using per-source placeholders until Entra mappings arrive (never inferring from roster size).");
             }
 
             var removedPlaceholder = _participantManager.TryBindAudioSource(sourceId, syntheticId, syntheticName, "SyntheticUntilGraph");
