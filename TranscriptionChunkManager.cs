@@ -28,6 +28,10 @@ public sealed class TranscriptionChunkManager : BackgroundService
 {
     private static readonly TimeSpan ChunkDuration = TimeSpan.FromMinutes(3);
 
+    /// <summary>3-minute ALB chunk: <c>length_limit_reached - 0</c> if any transcript text; <c>long_times_of_silence - 1</c> if none.</summary>
+    private const string AlbFlagLengthLimitReached = "length_limit_reached - 0";
+    private const string AlbFlagLongSilence = "long_times_of_silence - 1";
+
     private readonly BotSettings _settings;
     private readonly MeetingContextStore _meetingContext;
     private readonly IHttpClientFactory _httpClientFactory;
@@ -247,19 +251,18 @@ public sealed class TranscriptionChunkManager : BackgroundService
             return;
         }
 
+        var ordered = chunk.Items.OrderBy(i => i.Timestamp).ToList();
         var payload = new AlbChunkPayload
         {
-            StartTime = chunk.StartTime,
-            EndTime = chunk.EndTime,
-            Transcripts = chunk.Items
-                .OrderBy(i => i.Timestamp)
-                .Select(i => new AlbTranscriptLine
+            MeetingId = _meetingContext.CurrentMeetingId,
+            Transcript = ordered
+                .Select(i => new AlbTranscriptEntry
                 {
-                    Speaker = i.ParticipantName,
-                    Text = i.Text,
-                    Timestamp = i.Timestamp
+                    Name = i.ParticipantName,
+                    Text = i.Text
                 })
-                .ToList()
+                .ToList(),
+            Flag = ResolveAlbFlag(ordered)
         };
 
         try
@@ -267,7 +270,6 @@ public sealed class TranscriptionChunkManager : BackgroundService
             var client = _httpClientFactory.CreateClient("AlbTranscriptSender");
             var jsonOptions = new JsonSerializerOptions
             {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
                 DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
             };
 
@@ -280,8 +282,10 @@ public sealed class TranscriptionChunkManager : BackgroundService
             if (!response.IsSuccessStatusCode)
             {
                 _logger.LogWarning(
-                    "ALB chunk post failed. Status={Status}, Start={Start}, End={End}, Lines={Count}.",
+                    "ALB chunk post failed. Status={Status}, MeetingId={MeetingId}, Flag={Flag}, Start={Start}, End={End}, Lines={Count}.",
                     (int)response.StatusCode,
+                    payload.MeetingId,
+                    payload.Flag,
                     chunk.StartTime,
                     chunk.EndTime,
                     chunk.Items.Count);
@@ -289,7 +293,9 @@ public sealed class TranscriptionChunkManager : BackgroundService
             }
 
             _logger.LogInformation(
-                "Posted transcript chunk to ALB. Start={Start}, End={End}, Lines={Count}.",
+                "Posted transcript chunk to ALB. MeetingId={MeetingId}, Flag={Flag}, Start={Start}, End={End}, Lines={Count}.",
+                payload.MeetingId,
+                payload.Flag,
                 chunk.StartTime,
                 chunk.EndTime,
                 chunk.Items.Count);
@@ -300,17 +306,30 @@ public sealed class TranscriptionChunkManager : BackgroundService
         }
     }
 
-    private sealed class AlbChunkPayload
+    private static string ResolveAlbFlag(IReadOnlyList<TranscriptItem> items)
     {
-        public DateTime StartTime { get; set; }
-        public DateTime EndTime { get; set; }
-        public List<AlbTranscriptLine> Transcripts { get; set; } = new();
+        var hasText = items.Any(i => !string.IsNullOrWhiteSpace(i.Text));
+        return hasText ? AlbFlagLengthLimitReached : AlbFlagLongSilence;
     }
 
-    private sealed class AlbTranscriptLine
+    private sealed class AlbChunkPayload
     {
-        public string Speaker { get; set; } = string.Empty;
+        [JsonPropertyName("meeting_id")]
+        public string MeetingId { get; set; } = string.Empty;
+
+        [JsonPropertyName("transcript")]
+        public List<AlbTranscriptEntry> Transcript { get; set; } = new();
+
+        [JsonPropertyName("flag")]
+        public string Flag { get; set; } = string.Empty;
+    }
+
+    private sealed class AlbTranscriptEntry
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonPropertyName("text")]
         public string Text { get; set; } = string.Empty;
-        public DateTime Timestamp { get; set; }
     }
 }
