@@ -7,15 +7,18 @@ public sealed class TranscriptBroadcaster
 {
     private readonly IHubContext<TranscriptHub> _hubContext;
     private readonly TranscriptionChunkManager _chunkManager;
+    private readonly ParticipantManager _participantManager;
     private readonly ILogger<TranscriptBroadcaster> _logger;
 
     public TranscriptBroadcaster(
         IHubContext<TranscriptHub> hubContext,
         TranscriptionChunkManager chunkManager,
+        ParticipantManager participantManager,
         ILogger<TranscriptBroadcaster> logger)
     {
         _hubContext = hubContext;
         _chunkManager = chunkManager;
+        _participantManager = participantManager;
         _logger = logger;
     }
 
@@ -29,6 +32,9 @@ public sealed class TranscriptBroadcaster
         string? userPrincipalName = null,
         string? azureAdObjectId = null)
     {
+        var entraForClients = string.IsNullOrWhiteSpace(azureAdObjectId)
+            ? azureAdObjectId
+            : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId);
         try
         {
             await _hubContext.Clients.All.SendAsync("transcript", new
@@ -38,7 +44,7 @@ public sealed class TranscriptBroadcaster
                 awsSpeakerId,
                 speakerLabel,
                 userPrincipalName,
-                azureAdObjectId,
+                azureAdObjectId = entraForClients,
                 timestamp = DateTimeOffset.UtcNow
             });
         }

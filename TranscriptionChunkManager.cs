@@ -38,6 +38,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
     private readonly BotSettings _settings;
     private readonly MeetingContextStore _meetingContext;
+    private readonly ParticipantManager _participantManager;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<TranscriptionChunkManager> _logger;
 
@@ -52,11 +53,13 @@ public sealed class TranscriptionChunkManager : BackgroundService
     public TranscriptionChunkManager(
         BotSettings settings,
         MeetingContextStore meetingContext,
+        ParticipantManager participantManager,
         IHttpClientFactory httpClientFactory,
         ILogger<TranscriptionChunkManager> logger)
     {
         _settings = settings;
         _meetingContext = meetingContext;
+        _participantManager = participantManager;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
     }
@@ -171,7 +174,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
             _buffer.Add(new TranscriptItem
             {
                 Timestamp = utc,
-                EntraObjectId = participantId.Trim(),
+                EntraObjectId = _participantManager.GetEntraObjectIdForTranscriptPayload(participantId),
                 ParticipantName = speakerName.Trim(),
                 Text = text.Trim()
             });

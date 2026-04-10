@@ -61,6 +61,12 @@ public sealed class BotSettings
 
     /// <summary>Optional ALB endpoint that receives 3-minute transcript JSON payloads.</summary>
     public string? TranscriptAlbEndpoint { get; init; }
+
+    /// <summary>
+    /// When Graph never sends <c>mediaStreams</c> source ids, map each new MSI to the next human in roster join order (first-ingested first).
+    /// Names are real Entra roster names but may not match the correct speaker if MSI order ≠ join order. Default true.
+    /// </summary>
+    public bool MsiToRosterJoinOrderFallback { get; init; } = true;
 }
 
 public sealed class BotService

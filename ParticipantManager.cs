@@ -38,6 +38,9 @@ public sealed class ParticipantManager
     /// <summary>MSI/sourceId → Entra object id. Never overwritten with a different user.</summary>
     private readonly ConcurrentDictionary<uint, string> _sourceIdToParticipantId = new();
 
+    /// <summary>When MSI is still bound to <c>msi-pending-*</c>, roster Entra oid from join-order fallback (for ALB <c>entra_id</c>).</summary>
+    private readonly ConcurrentDictionary<uint, string> _joinOrderEntraOidBySourceId = new();
+
     private string _meetingKey = string.Empty;
 
     public ParticipantManager(ILogger<ParticipantManager> logger)
@@ -53,6 +56,7 @@ public sealed class ParticipantManager
             _meetingKey = string.IsNullOrWhiteSpace(callOrMeetingId) ? Guid.NewGuid().ToString("N") : callOrMeetingId.Trim();
             _participants.Clear();
             _sourceIdToParticipantId.Clear();
+            _joinOrderEntraOidBySourceId.Clear();
             _logger.LogInformation("ParticipantManager reset for meeting key {MeetingKey}.", _meetingKey);
         }
     }
@@ -108,6 +112,7 @@ public sealed class ParticipantManager
             {
                 if (_sourceIdToParticipantId.TryUpdate(sourceId, pid, existingPid))
                 {
+                    _joinOrderEntraOidBySourceId.TryRemove(sourceId, out _);
                     RegisterParticipant(pid, displayName, DateTime.UtcNow);
                     _logger.LogInformation(
                         "Upgraded sourceId {SourceId} from placeholder {OldParticipantId} to Entra user {NewParticipantId} ({Reason}).",
@@ -158,6 +163,55 @@ public sealed class ParticipantManager
         participantId = pid;
         displayName = GetCanonicalDisplayName(pid) ?? pid;
         return true;
+    }
+
+    /// <summary>Records roster Entra oid for join-order display fallback (MSI still synthetic until Graph upgrades).</summary>
+    public void SetJoinOrderEntraHint(uint sourceId, string entraObjectId)
+    {
+        if (string.IsNullOrWhiteSpace(entraObjectId))
+        {
+            return;
+        }
+
+        _joinOrderEntraOidBySourceId[sourceId] = entraObjectId.Trim();
+    }
+
+    /// <summary>
+    /// Entra object id for transcript payloads: real oid when bound or join-order hint; otherwise synthetic id string.
+    /// </summary>
+    public string GetEntraObjectIdForTranscriptPayload(string participantId)
+    {
+        if (string.IsNullOrWhiteSpace(participantId))
+        {
+            return string.Empty;
+        }
+
+        var p = participantId.Trim();
+        if (!IsSyntheticParticipantId(p))
+        {
+            return p;
+        }
+
+        if (!TryParseSourceIdFromSynthetic(p, out var sid))
+        {
+            return p;
+        }
+
+        return _joinOrderEntraOidBySourceId.TryGetValue(sid, out var oid) && !string.IsNullOrWhiteSpace(oid)
+            ? oid.Trim()
+            : p;
+    }
+
+    public static bool TryParseSourceIdFromSynthetic(string? participantId, out uint sourceId)
+    {
+        sourceId = 0;
+        if (!IsSyntheticParticipantId(participantId) || participantId is null)
+        {
+            return false;
+        }
+
+        var suffix = participantId.Substring(SyntheticIdPrefix.Length);
+        return uint.TryParse(suffix, out sourceId);
     }
 
     /// <summary>Canonical display name for transcripts (Teams/Entra only; first registered wins).</summary>

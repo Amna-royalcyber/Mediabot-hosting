@@ -15,7 +15,11 @@ public sealed class ParticipantAudioRouter
     private readonly AwsTranscribeService _awsTranscribeService;
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ParticipantManager _participantManager;
+    private readonly BotSettings _settings;
     private readonly ILogger<ParticipantAudioRouter> _logger;
+
+    /// <summary>Distinct MSIs seen while Graph omitted mediaStreams; paired to <see cref="MeetingParticipantService"/> roster order.</summary>
+    private readonly List<uint> _joinOrderFallbackSourceIds = new();
 
     /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
     private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
@@ -42,12 +46,14 @@ public sealed class ParticipantAudioRouter
         AwsTranscribeService awsTranscribeService,
         MeetingParticipantService meetingParticipants,
         ParticipantManager participantManager,
+        BotSettings settings,
         ILogger<ParticipantAudioRouter> logger)
     {
         _audioProcessor = audioProcessor;
         _awsTranscribeService = awsTranscribeService;
         _meetingParticipants = meetingParticipants;
         _participantManager = participantManager;
+        _settings = settings;
         _logger = logger;
     }
 
@@ -61,6 +67,11 @@ public sealed class ParticipantAudioRouter
         lock (_rescanLock)
         {
             _lastParticipantRescanUtc = DateTime.MinValue;
+        }
+
+        lock (_inferLock)
+        {
+            _joinOrderFallbackSourceIds.Clear();
         }
 
         var bot = _botClientId;
@@ -282,6 +293,39 @@ public sealed class ParticipantAudioRouter
     }
 
     /// <summary>
+    /// Maps the Nth distinct MSI (first-seen order) to the Nth human in roster ingest order. Caller must hold <see cref="_inferLock"/>.
+    /// </summary>
+    private bool TryAllocateJoinOrderRosterNoLock(uint sourceId, IReadOnlyList<RosterParticipantDto> roster, out string participantId, out string displayName)
+    {
+        participantId = string.Empty;
+        displayName = string.Empty;
+        if (!_settings.MsiToRosterJoinOrderFallback || roster.Count == 0)
+        {
+            return false;
+        }
+
+        var idx = _joinOrderFallbackSourceIds.IndexOf(sourceId);
+        if (idx < 0)
+        {
+            _joinOrderFallbackSourceIds.Add(sourceId);
+            idx = _joinOrderFallbackSourceIds.Count - 1;
+            if (idx == 0)
+            {
+                _logger.LogWarning(
+                    "Graph did not provide mediaStreams source ids; using join-order fallback (Nth new MSI → Nth roster participant by ingest order). " +
+                    "Entra display names are real; speaker↔name alignment is best-effort. Disable with Bot:MsiToRosterJoinOrderFallback=false.");
+            }
+        }
+
+        var rIdx = Math.Min(idx, roster.Count - 1);
+        var p = roster[rIdx];
+        participantId = p.AzureAdObjectId;
+        displayName = string.IsNullOrWhiteSpace(p.DisplayName) ? participantId : p.DisplayName.Trim();
+        _participantManager.SetJoinOrderEntraHint(sourceId, p.AzureAdObjectId);
+        return true;
+    }
+
+    /// <summary>
     /// When Graph omits <c>mediaStreams[].sourceId</c> for a stream, we never map that MSI to a roster user by headcount
     /// (e.g. "only one person in roster") — that mis-assigns the first packets before others join. Use a per-source placeholder;
     /// <see cref="ParticipantManager.TryBindAudioSource"/> upgrades to Entra when Graph sends mediaStreams.
@@ -306,12 +350,26 @@ public sealed class ParticipantAudioRouter
                 return false;
             }
 
+            if (_settings.MsiToRosterJoinOrderFallback &&
+                TryAllocateJoinOrderRosterNoLock(sourceId, roster, out _, out var fjDn))
+            {
+                var synId = ParticipantManager.SyntheticParticipantId(sourceId);
+                var removedFj = _participantManager.TryBindAudioSource(sourceId, synId, fjDn, "JoinOrderDisplayFallback");
+                if (removedFj is not null)
+                {
+                    _awsTranscribeService.RemoveParticipant(removedFj);
+                }
+
+                _awsTranscribeService.UpsertParticipant(synId, fjDn);
+                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
+            }
+
             var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
             var syntheticName = $"Speaker ({sourceId})";
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
                 _logger.LogInformation(
-                    "Graph has not mapped mediaStreams for some streams yet; using per-source placeholders until Entra mappings arrive (never inferring from roster size).");
+                    "Graph has not mapped mediaStreams for some streams yet; using per-source placeholders until Entra mappings arrive (set Bot:MsiToRosterJoinOrderFallback=true for Entra names by join order).");
             }
 
             var removedPlaceholder = _participantManager.TryBindAudioSource(sourceId, syntheticId, syntheticName, "SyntheticUntilGraph");
@@ -368,27 +426,44 @@ public sealed class ParticipantAudioRouter
             return true;
         }
 
-        // 2+ humans, dominant MSI known but not yet mapped to Entra: use same per-MSI placeholder as unmixed (upgrades when Graph arrives).
+        // 2+ humans, dominant MSI known but not yet mapped to Entra: join-order fallback or per-MSI placeholder.
         if (dom != none)
         {
-            if (Interlocked.Increment(ref _loggedUnmappedDominantMixed) == 1)
+            lock (_inferLock)
             {
-                _logger.LogInformation(
-                    "Mixed audio: dominant sourceId {SourceId} not mapped to Entra yet (multiple participants). " +
-                    "Using placeholder label until Graph sends mediaStreams.",
-                    dom);
-            }
+                if (_settings.MsiToRosterJoinOrderFallback &&
+                    TryAllocateJoinOrderRosterNoLock(dom, roster, out _, out var fjDn))
+                {
+                    var synId = ParticipantManager.SyntheticParticipantId(dom);
+                    var removedFj = _participantManager.TryBindAudioSource(dom, synId, fjDn, "JoinOrderDisplayFallbackMixed");
+                    if (removedFj is not null)
+                    {
+                        _awsTranscribeService.RemoveParticipant(removedFj);
+                    }
 
-            var syntheticId = ParticipantManager.SyntheticParticipantId(dom);
-            var syntheticName = $"Speaker ({dom})";
-            var removedPh = _participantManager.TryBindAudioSource(dom, syntheticId, syntheticName, "SyntheticDominantMixed");
-            if (removedPh is not null)
-            {
-                _awsTranscribeService.RemoveParticipant(removedPh);
-            }
+                    _awsTranscribeService.UpsertParticipant(synId, fjDn);
+                    return _participantManager.TryResolveAudioSource(dom, out participantId, out displayName);
+                }
 
-            _awsTranscribeService.UpsertParticipant(syntheticId, syntheticName);
-            return _participantManager.TryResolveAudioSource(dom, out participantId, out displayName);
+                if (Interlocked.Increment(ref _loggedUnmappedDominantMixed) == 1)
+                {
+                    _logger.LogInformation(
+                        "Mixed audio: dominant sourceId {SourceId} not mapped to Entra yet (multiple participants). " +
+                        "Using placeholder label until Graph sends mediaStreams.",
+                        dom);
+                }
+
+                var syntheticId = ParticipantManager.SyntheticParticipantId(dom);
+                var syntheticName = $"Speaker ({dom})";
+                var removedPh = _participantManager.TryBindAudioSource(dom, syntheticId, syntheticName, "SyntheticDominantMixed");
+                if (removedPh is not null)
+                {
+                    _awsTranscribeService.RemoveParticipant(removedPh);
+                }
+
+                _awsTranscribeService.UpsertParticipant(syntheticId, syntheticName);
+                return _participantManager.TryResolveAudioSource(dom, out participantId, out displayName);
+            }
         }
 
         if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
