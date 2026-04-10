@@ -24,12 +24,10 @@ public sealed class ParticipantAudioRouter
     private int _loggedMixedMode;
     private int _loggedUnmappedDominantMixed;
     private int _loggedDominantNotYetMixed;
-    private int _loggedHeuristicMultiInference;
+    private int _loggedMultiParticipantInferenceSkipped;
 
-    /// <summary>Order in which previously unknown source ids first appeared (for pairing with roster when Graph omits mediaStreams).</summary>
     private readonly object _inferLock = new();
 
-    private readonly List<uint> _sourceIdDiscoveryOrder = new();
     private readonly ConcurrentDictionary<uint, byte> _warnedUnmappedSourceIds = new();
 
     public ParticipantAudioRouter(
@@ -48,11 +46,6 @@ public sealed class ParticipantAudioRouter
 
     public void AttachToCall(ICall call, string botClientId)
     {
-        lock (_inferLock)
-        {
-            _sourceIdDiscoveryOrder.Clear();
-        }
-
         call.Participants.OnUpdated += (_, args) =>
         {
             foreach (var p in args.AddedResources)
@@ -200,8 +193,8 @@ public sealed class ParticipantAudioRouter
     }
 
     /// <summary>
-    /// Graph often omits <c>mediaStreams[].sourceId</c> for some participants. Map unmixed <paramref name="sourceId"/>
-    /// to the roster user who is not yet tied to any source, or pair by discovery order vs sorted display names.
+    /// When Graph omits <c>mediaStreams[].sourceId</c>, we only infer identity if exactly one human has no binding yet.
+    /// With two or more unmapped users, guessing (e.g. join order vs name sort) swaps speakers — we refuse and wait for Graph.
     /// </summary>
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
@@ -232,7 +225,12 @@ public sealed class ParticipantAudioRouter
             if (unmappedHumans.Count == 1)
             {
                 var p = unmappedHumans[0];
-                _participantManager.TryBindAudioSource(sourceId, p.AzureAdObjectId, p.DisplayName, "InferenceSingleRoster");
+                var removed = _participantManager.TryBindAudioSource(sourceId, p.AzureAdObjectId, p.DisplayName, "InferenceSingleRoster");
+                if (removed is not null)
+                {
+                    _awsTranscribeService.RemoveParticipant(removed);
+                }
+
                 _awsTranscribeService.UpsertParticipant(p.AzureAdObjectId, p.DisplayName);
                 _logger.LogInformation(
                     "Inferred sourceId {SourceId} → {DisplayName} (only roster user without a Graph mediaStreams sourceId).",
@@ -241,33 +239,23 @@ public sealed class ParticipantAudioRouter
                 return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
             }
 
-            if (!_sourceIdDiscoveryOrder.Contains(sourceId))
+            // Multiple humans: use a non-Entra placeholder per source id (no cross-participant guessing). Graph can upgrade later.
+            var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
+            var syntheticName = $"Speaker ({sourceId})";
+            if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
-                _sourceIdDiscoveryOrder.Add(sourceId);
+                _logger.LogInformation(
+                    "Graph has not mapped mediaStreams source ids yet; using per-stream placeholders {Placeholder} until Entra mappings arrive.",
+                    syntheticName);
             }
 
-            var sorted = unmappedHumans.OrderBy(h => h.DisplayName, StringComparer.OrdinalIgnoreCase).ToList();
-            var idx = _sourceIdDiscoveryOrder.IndexOf(sourceId);
-            if (idx < 0)
+            var removedPlaceholder = _participantManager.TryBindAudioSource(sourceId, syntheticId, syntheticName, "SyntheticUntilGraph");
+            if (removedPlaceholder is not null)
             {
-                return false;
+                _awsTranscribeService.RemoveParticipant(removedPlaceholder);
             }
 
-            idx = Math.Min(idx, sorted.Count - 1);
-            var pick = sorted[idx];
-            _participantManager.TryBindAudioSource(sourceId, pick.AzureAdObjectId, pick.DisplayName, "InferenceHeuristic");
-            _awsTranscribeService.UpsertParticipant(pick.AzureAdObjectId, pick.DisplayName);
-            if (Interlocked.Increment(ref _loggedHeuristicMultiInference) == 1)
-            {
-                _logger.LogWarning(
-                    "Several participants lack mediaStreams sourceId in Graph. Pairing new source ids to roster users by first-seen order vs sorted display names (best-effort).");
-            }
-
-            _logger.LogDebug(
-                "Inferred sourceId {SourceId} → {DisplayName} (heuristic index {Idx}).",
-                sourceId,
-                pick.DisplayName,
-                idx);
+            _awsTranscribeService.UpsertParticipant(syntheticId, syntheticName);
             return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
         }
     }
@@ -306,32 +294,36 @@ public sealed class ParticipantAudioRouter
             return true;
         }
 
+        // 2+ humans, dominant MSI known but not yet mapped to Entra: use same per-MSI placeholder as unmixed (upgrades when Graph arrives).
         if (dom != none)
         {
             if (Interlocked.Increment(ref _loggedUnmappedDominantMixed) == 1)
             {
-                _logger.LogWarning(
-                    "Mixed audio: dominant sourceId {SourceId} is not bound to an Entra user yet. " +
-                    "Ensure Graph participant updates include mediaStreams with matching sourceId. " +
-                    "Using first roster participant as temporary label.",
+                _logger.LogInformation(
+                    "Mixed audio: dominant sourceId {SourceId} not mapped to Entra yet (multiple participants). " +
+                    "Using placeholder label until Graph sends mediaStreams.",
                     dom);
             }
 
-            participantId = roster[0].AzureAdObjectId;
-            displayName = roster[0].DisplayName;
-            return true;
+            var syntheticId = ParticipantManager.SyntheticParticipantId(dom);
+            var syntheticName = $"Speaker ({dom})";
+            var removedPh = _participantManager.TryBindAudioSource(dom, syntheticId, syntheticName, "SyntheticDominantMixed");
+            if (removedPh is not null)
+            {
+                _awsTranscribeService.RemoveParticipant(removedPh);
+            }
+
+            _awsTranscribeService.UpsertParticipant(syntheticId, syntheticName);
+            return _participantManager.TryResolveAudioSource(dom, out participantId, out displayName);
         }
 
         if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
         {
             _logger.LogWarning(
-                "Mixed audio: dominant speaker not reported yet; labeling transcripts as {Name} until MSI arrives.",
-                roster[0].DisplayName);
+                "Mixed audio: dominant speaker not reported yet with multiple participants; dropping frames until MSI maps to a user.");
         }
 
-        participantId = roster[0].AzureAdObjectId;
-        displayName = roster[0].DisplayName;
-        return true;
+        return false;
     }
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
@@ -363,7 +355,12 @@ public sealed class ParticipantAudioRouter
 
         foreach (var sourceId in TryExtractSourceIds(resource))
         {
-            _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
+            var removedSyn = _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
+            if (removedSyn is not null)
+            {
+                _awsTranscribeService.RemoveParticipant(removedSyn);
+            }
+
             _logger.LogInformation("Bound sourceId {SourceId} -> {DisplayName} ({ParticipantId}).", sourceId, dn, pid);
         }
 

@@ -16,10 +16,19 @@ public sealed class ParticipantInfo
 }
 
 /// <summary>
-/// Global participant registry and immutable audio source-id → Entra user mapping for a meeting.
+/// Global participant registry and audio source-id → participant mapping for a meeting.
+/// Placeholder ids (<see cref="IsSyntheticParticipantId"/>) may be upgraded to Entra ids when Graph sends mediaStreams.
 /// </summary>
 public sealed class ParticipantManager
 {
+    public const string SyntheticIdPrefix = "msi-pending-";
+
+    public static string SyntheticParticipantId(uint sourceId) => $"{SyntheticIdPrefix}{sourceId}";
+
+    public static bool IsSyntheticParticipantId(string? participantId) =>
+        !string.IsNullOrEmpty(participantId) &&
+        participantId.StartsWith(SyntheticIdPrefix, StringComparison.OrdinalIgnoreCase);
+
     private readonly ILogger<ParticipantManager> _logger;
     private readonly object _lifecycleLock = new();
 
@@ -72,13 +81,15 @@ public sealed class ParticipantManager
     }
 
     /// <summary>
-    /// Bind a Teams media source id to an Entra user. If already bound to another user, the existing binding wins.
+    /// Bind a Teams media source id to a participant id (Entra oid or synthetic placeholder).
+    /// If the source was bound to a <see cref="IsSyntheticParticipantId"/> placeholder and the new id is a real Entra user, the binding is upgraded.
     /// </summary>
-    public bool TryBindAudioSource(uint sourceId, string participantId, string displayName, string reason)
+    /// <returns>Previous synthetic participant id whose Transcribe session should be removed after a successful Graph upgrade; otherwise null.</returns>
+    public string? TryBindAudioSource(uint sourceId, string participantId, string displayName, string reason)
     {
         if (string.IsNullOrWhiteSpace(participantId))
         {
-            return false;
+            return null;
         }
 
         var pid = participantId.Trim();
@@ -88,22 +99,41 @@ public sealed class ParticipantManager
 
         if (_sourceIdToParticipantId.TryGetValue(sourceId, out var existingPid))
         {
-            if (!string.Equals(existingPid, pid, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(existingPid, pid, StringComparison.OrdinalIgnoreCase))
             {
-                _logger.LogWarning(
-                    "Ignoring {Reason} bind for sourceId {SourceId} → {NewParticipantId}; already bound to {ExistingParticipantId}.",
-                    reason,
-                    sourceId,
-                    pid,
-                    existingPid);
+                return null;
             }
 
-            return true;
+            if (IsSyntheticParticipantId(existingPid) && !IsSyntheticParticipantId(pid))
+            {
+                if (_sourceIdToParticipantId.TryUpdate(sourceId, pid, existingPid))
+                {
+                    RegisterParticipant(pid, displayName, DateTime.UtcNow);
+                    _logger.LogInformation(
+                        "Upgraded sourceId {SourceId} from placeholder {OldParticipantId} to Entra user {NewParticipantId} ({Reason}).",
+                        sourceId,
+                        existingPid,
+                        pid,
+                        reason);
+                    return existingPid;
+                }
+
+                return null;
+            }
+
+            _logger.LogWarning(
+                "Ignoring {Reason} bind for sourceId {SourceId} → {NewParticipantId}; already bound to {ExistingParticipantId}.",
+                reason,
+                sourceId,
+                pid,
+                existingPid);
+
+            return null;
         }
 
         if (!_sourceIdToParticipantId.TryAdd(sourceId, pid))
         {
-            return true;
+            return null;
         }
 
         _logger.LogInformation(
@@ -113,7 +143,7 @@ public sealed class ParticipantManager
             pid,
             reason);
 
-        return true;
+        return null;
     }
 
     public bool TryResolveAudioSource(uint sourceId, out string participantId, out string displayName)
