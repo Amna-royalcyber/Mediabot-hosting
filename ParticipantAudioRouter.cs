@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using System.Threading;
 using System.Linq;
 using Microsoft.Extensions.Logging;
@@ -20,6 +19,14 @@ public sealed class ParticipantAudioRouter
 
     /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
     private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
+
+    /// <summary>Last non-<see cref="DominantSpeakerChangedEventArgs.None"/> dominant MSI (Teams sometimes reports None between packets).</summary>
+    private uint _lastNonNoneDominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
+
+    private ICall? _attachedCall;
+    private string _botClientId = string.Empty;
+    private readonly object _rescanLock = new();
+    private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
 
     private int _loggedMixedMode;
     private int _loggedUnmappedDominantMixed;
@@ -46,15 +53,26 @@ public sealed class ParticipantAudioRouter
 
     public void AttachToCall(ICall call, string botClientId)
     {
+        _attachedCall = call;
+        _botClientId = botClientId ?? string.Empty;
+        var none = (uint)DominantSpeakerChangedEventArgs.None;
+        _dominantSourceId = none;
+        _lastNonNoneDominantSourceId = none;
+        lock (_rescanLock)
+        {
+            _lastParticipantRescanUtc = DateTime.MinValue;
+        }
+
+        var bot = _botClientId;
         call.Participants.OnUpdated += (_, args) =>
         {
             foreach (var p in args.AddedResources)
             {
-                UpsertParticipantMappings(p, botClientId);
+                UpsertParticipantMappings(p, bot);
             }
             foreach (var p in args.UpdatedResources)
             {
-                UpsertParticipantMappings(p, botClientId);
+                UpsertParticipantMappings(p, bot);
             }
             foreach (var p in args.RemovedResources)
             {
@@ -63,7 +81,7 @@ public sealed class ParticipantAudioRouter
         };
 
         // Roster may already contain participants before delta events; hydrate bindings immediately.
-        TryHydrateFromCurrentRoster(call, botClientId);
+        TryHydrateFromCurrentRoster(call, bot);
     }
 
     private void TryHydrateFromCurrentRoster(ICall call, string botClientId)
@@ -83,6 +101,8 @@ public sealed class ParticipantAudioRouter
 
     public async Task HandleAudioAsync(AudioMediaReceivedEventArgs args)
     {
+        MaybeRescanParticipantMediaStreams();
+
         var unmixed = args.Buffer.UnmixedAudioBuffers;
         if (unmixed is null || !unmixed.Any())
         {
@@ -101,11 +121,14 @@ public sealed class ParticipantAudioRouter
 
             if (!_participantManager.TryResolveAudioSource(sourceId, out var participantId, out var displayName))
             {
-                var roster = _meetingParticipants.GetRosterSnapshot();
-                if (!TryInferBindingForUnmappedSource(sourceId, roster, out participantId, out displayName))
+                if (!TryApplyRosterMediaStreamMap(sourceId, out participantId, out displayName))
                 {
-                    LogUnmappedSourceIdOnce(sourceId);
-                    continue;
+                    var roster = _meetingParticipants.GetRosterSnapshot();
+                    if (!TryInferBindingForUnmappedSource(sourceId, roster, out participantId, out displayName))
+                    {
+                        LogUnmappedSourceIdOnce(sourceId);
+                        continue;
+                    }
                 }
             }
 
@@ -190,6 +213,72 @@ public sealed class ParticipantAudioRouter
     public void SetDominantSpeaker(uint sourceId)
     {
         _dominantSourceId = sourceId;
+        var none = (uint)DominantSpeakerChangedEventArgs.None;
+        if (sourceId != none)
+        {
+            _lastNonNoneDominantSourceId = sourceId;
+        }
+    }
+
+    /// <summary>
+    /// Graph often adds <c>mediaStreams</c> after the first audio frames. Delta callbacks can be missed; re-scan fixes Entra names for demos.
+    /// </summary>
+    private void MaybeRescanParticipantMediaStreams()
+    {
+        var call = _attachedCall;
+        var botId = _botClientId;
+        if (call is null || string.IsNullOrWhiteSpace(botId))
+        {
+            return;
+        }
+
+        lock (_rescanLock)
+        {
+            if ((DateTime.UtcNow - _lastParticipantRescanUtc).TotalSeconds < 2.5)
+            {
+                return;
+            }
+
+            _lastParticipantRescanUtc = DateTime.UtcNow;
+        }
+
+        try
+        {
+            _meetingParticipants.ResyncParticipantMediaStreamsFromCall(call, botId);
+            foreach (var p in call.Participants)
+            {
+                UpsertParticipantMappings(p, botId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Periodic participant mediaStreams rescan failed.");
+        }
+    }
+
+    /// <summary>
+    /// When <see cref="MeetingParticipantService"/> has already correlated MSI → Entra from <c>mediaStreams</c> (same parse as Graph), upgrade <see cref="ParticipantManager"/> from synthetic.
+    /// </summary>
+    private bool TryApplyRosterMediaStreamMap(uint sourceId, out string participantId, out string displayName)
+    {
+        participantId = string.Empty;
+        displayName = string.Empty;
+        if (!_meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var oid, out var dn))
+        {
+            return false;
+        }
+
+        lock (_inferLock)
+        {
+            var removed = _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
+            if (removed is not null)
+            {
+                _awsTranscribeService.RemoveParticipant(removed);
+            }
+
+            _awsTranscribeService.UpsertParticipant(oid, dn);
+            return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
+        }
     }
 
     /// <summary>
@@ -252,8 +341,17 @@ public sealed class ParticipantAudioRouter
         displayName = string.Empty;
         var none = (uint)DominantSpeakerChangedEventArgs.None;
         var dom = _dominantSourceId;
+        if (dom == none && _lastNonNoneDominantSourceId != none)
+        {
+            dom = _lastNonNoneDominantSourceId;
+        }
 
         if (dom != none && _participantManager.TryResolveAudioSource(dom, out participantId, out displayName))
+        {
+            return true;
+        }
+
+        if (dom != none && TryApplyRosterMediaStreamMap(dom, out participantId, out displayName))
         {
             return true;
         }
@@ -329,7 +427,7 @@ public sealed class ParticipantAudioRouter
         var dn = displayName.Trim();
         _participantManager.RegisterParticipant(pid, dn, DateTime.UtcNow);
 
-        foreach (var sourceId in TryExtractSourceIds(resource))
+        foreach (var sourceId in GraphParticipantMediaStreams.ExtractSourceIds(resource))
         {
             var removedSyn = _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
             if (removedSyn is not null)
@@ -352,109 +450,6 @@ public sealed class ParticipantAudioRouter
         }
 
         _awsTranscribeService.RemoveParticipant(participantId.Trim());
-    }
-
-    private static List<uint> TryExtractSourceIds(Microsoft.Graph.Models.Participant? participant)
-    {
-        var list = new List<uint>();
-        if (participant?.AdditionalData is null)
-        {
-            return list;
-        }
-
-        object? msObj = null;
-        foreach (var kvp in participant.AdditionalData)
-        {
-            if (string.Equals(kvp.Key, "mediaStreams", StringComparison.OrdinalIgnoreCase))
-            {
-                msObj = kvp.Value;
-                break;
-            }
-        }
-
-        if (msObj is null)
-        {
-            return list;
-        }
-
-        if (msObj is JsonElement je && je.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var stream in je.EnumerateArray())
-            {
-                if (stream.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-
-                if (stream.TryGetProperty("sourceId", out var src))
-                {
-                    if (src.ValueKind == JsonValueKind.Number && src.TryGetUInt32(out var n))
-                    {
-                        list.Add(n);
-                    }
-                    else if (src.ValueKind == JsonValueKind.String &&
-                             uint.TryParse(src.GetString(), out var s))
-                    {
-                        list.Add(s);
-                    }
-                }
-            }
-        }
-        else if (msObj is JsonElement js && js.ValueKind == JsonValueKind.String)
-        {
-            var raw = js.GetString();
-            if (!string.IsNullOrWhiteSpace(raw) && TryParseFromJson(raw, list))
-            {
-                return list;
-            }
-        }
-        else if (msObj is string str && TryParseFromJson(str, list))
-        {
-            return list;
-        }
-
-        return list;
-    }
-
-    private static bool TryParseFromJson(string json, List<uint> list)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.ValueKind != JsonValueKind.Array)
-            {
-                return false;
-            }
-
-            foreach (var stream in doc.RootElement.EnumerateArray())
-            {
-                if (stream.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
-
-                if (!stream.TryGetProperty("sourceId", out var src))
-                {
-                    continue;
-                }
-
-                if (src.ValueKind == JsonValueKind.Number && src.TryGetUInt32(out var n))
-                {
-                    list.Add(n);
-                }
-                else if (src.ValueKind == JsonValueKind.String &&
-                         uint.TryParse(src.GetString(), out var s))
-                {
-                    list.Add(s);
-                }
-            }
-
-            return list.Count > 0;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static byte[] CopyUnmixedBuffer(IntPtr ptr, long length)

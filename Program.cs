@@ -79,6 +79,7 @@ public static class Program
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());
         builder.Services.AddSingleton<EntraUserResolver>();
         builder.Services.AddSingleton<MeetingParticipantService>();
+        builder.Services.AddSingleton<TranscriptIdentityResolver>();
         builder.Services.AddSingleton<TranscriptionManager>();
         builder.Services.AddSingleton<ParticipantAudioStreamHandler>();
         builder.Services.AddSingleton<ParticipantAudioRouter>();

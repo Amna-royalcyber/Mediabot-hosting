@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
@@ -27,6 +28,9 @@ public sealed class MeetingParticipantService
     /// <summary>Stable order of human participants for spk_N → row N mapping.</summary>
     private readonly List<RosterEntry> _rosterOrder = new();
 
+    /// <summary>Teams audio <c>sourceId</c> → Entra object id from roster <c>mediaStreams</c> (links placeholders to real users).</summary>
+    private readonly ConcurrentDictionary<uint, string> _audioSourceIdToAzureObjectId = new();
+
     public MeetingParticipantService(
         TranscriptBroadcaster broadcaster,
         EntraUserResolver entra,
@@ -39,6 +43,13 @@ public sealed class MeetingParticipantService
 
     public void AttachToCall(ICall call, string botAzureAdApplicationClientId)
     {
+        _audioSourceIdToAzureObjectId.Clear();
+        lock (_lock)
+        {
+            _callParticipantIdToAzureUserId.Clear();
+            _rosterOrder.Clear();
+        }
+
         var participants = call.Participants;
         participants.OnUpdated += (_, args) =>
         {
@@ -80,6 +91,24 @@ public sealed class MeetingParticipantService
         _logger.LogInformation("Subscribed to call participant roster updates; Entra profiles resolved via Microsoft Graph when needed.");
     }
 
+    /// <summary>
+    /// Re-ingests every participant resource (late <c>mediaStreams</c> / <c>sourceId</c>). Pair with <see cref="ParticipantAudioRouter"/> periodic rescan for demos.
+    /// </summary>
+    public void ResyncParticipantMediaStreamsFromCall(ICall call, string botAzureAdApplicationClientId)
+    {
+        try
+        {
+            foreach (var p in call.Participants)
+            {
+                IngestParticipant(p, botAzureAdApplicationClientId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Resync participant mediaStreams from call failed.");
+        }
+    }
+
     /// <summary>Maps spk_N to the Nth human participant row (first-seen Azure AD user order).</summary>
     public SpeakerResolution? TryResolveSpeaker(string? awsSpeakerId)
     {
@@ -107,6 +136,33 @@ public sealed class MeetingParticipantService
         }
 
         return null;
+    }
+
+    /// <summary>Resolve Teams MSI/source id to Entra user using roster mediaStreams (when Graph lists source ids before audio bind upgrades).</summary>
+    public bool TryResolveAudioSourceToEntra(uint sourceId, out string azureAdObjectId, out string displayName)
+    {
+        azureAdObjectId = string.Empty;
+        displayName = string.Empty;
+        if (!_audioSourceIdToAzureObjectId.TryGetValue(sourceId, out var oid) || string.IsNullOrWhiteSpace(oid))
+        {
+            return false;
+        }
+
+        azureAdObjectId = oid.Trim();
+        lock (_lock)
+        {
+            foreach (var e in _rosterOrder)
+            {
+                if (string.Equals(e.AzureAdObjectId, azureAdObjectId, StringComparison.OrdinalIgnoreCase))
+                {
+                    displayName = string.IsNullOrWhiteSpace(e.DisplayName) ? azureAdObjectId : e.DisplayName.Trim();
+                    return true;
+                }
+            }
+        }
+
+        displayName = azureAdObjectId;
+        return true;
     }
 
     public IReadOnlyList<RosterParticipantDto> GetRosterSnapshot()
@@ -185,6 +241,11 @@ public sealed class MeetingParticipantService
             }
         }
 
+        foreach (var sid in GraphParticipantMediaStreams.ExtractSourceIds(resource))
+        {
+            _audioSourceIdToAzureObjectId[sid] = azureUserId;
+        }
+
         _ = PublishRosterAsync();
 
         if (needsGraph)
@@ -239,15 +300,27 @@ public sealed class MeetingParticipantService
             return;
         }
 
+        string? removedAzureId = null;
         lock (_lock)
         {
-            if (!_callParticipantIdToAzureUserId.ContainsKey(callPartId))
+            if (!_callParticipantIdToAzureUserId.TryGetValue(callPartId, out removedAzureId))
             {
                 return;
             }
 
             _callParticipantIdToAzureUserId.Remove(callPartId);
             _rosterOrder.RemoveAll(e => string.Equals(e.CallParticipantId, callPartId, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(removedAzureId))
+        {
+            foreach (var kv in _audioSourceIdToAzureObjectId.ToArray())
+            {
+                if (string.Equals(kv.Value, removedAzureId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _audioSourceIdToAzureObjectId.TryRemove(kv.Key, out _);
+                }
+            }
         }
 
         _ = PublishRosterAsync();

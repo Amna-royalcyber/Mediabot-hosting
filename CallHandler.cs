@@ -183,13 +183,22 @@ public sealed class CallHandler
                 ri?.Subcode,
                 ri?.Message);
 
-            if (r?.State?.ToString() == "Established")
+            var stateStr = r?.State?.ToString();
+            if (string.Equals(stateStr, "Established", StringComparison.OrdinalIgnoreCase))
             {
                 var established = DateTime.UtcNow;
                 _meetingContext.SetCallEstablishedUtc(established);
                 _transcriptionChunkManager.BeginMeeting(established);
                 _logger.LogInformation(
                     "Call established. MediaHandler is receiving unmixed participant audio; speaking participants should produce per-source audio frames.");
+            }
+            else if (!string.IsNullOrEmpty(stateStr) &&
+                     (stateStr.Equals("Terminated", StringComparison.OrdinalIgnoreCase) ||
+                      stateStr.Equals("Disconnecting", StringComparison.OrdinalIgnoreCase)))
+            {
+                _transcriptionChunkManager.EndMeeting();
+                _meetingContext.ResetMeetingContext();
+                _logger.LogInformation("Call ended (State={State}); transcription chunk timer stopped for this meeting.", stateStr);
             }
         };
 
