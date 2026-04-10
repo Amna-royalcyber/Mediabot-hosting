@@ -24,10 +24,12 @@ public sealed class ParticipantAudioRouter
     private int _loggedMixedMode;
     private int _loggedUnmappedDominantMixed;
     private int _loggedDominantNotYetMixed;
-    private int _loggedMultiParticipantInferenceSkipped;
+    private int _loggedHeuristicMultiInference;
 
+    /// <summary>Order in which previously unknown source ids first appeared (for pairing with roster when Graph omits mediaStreams).</summary>
     private readonly object _inferLock = new();
 
+    private readonly List<uint> _sourceIdDiscoveryOrder = new();
     private readonly ConcurrentDictionary<uint, byte> _warnedUnmappedSourceIds = new();
 
     public ParticipantAudioRouter(
@@ -46,6 +48,11 @@ public sealed class ParticipantAudioRouter
 
     public void AttachToCall(ICall call, string botClientId)
     {
+        lock (_inferLock)
+        {
+            _sourceIdDiscoveryOrder.Clear();
+        }
+
         call.Participants.OnUpdated += (_, args) =>
         {
             foreach (var p in args.AddedResources)
@@ -193,8 +200,8 @@ public sealed class ParticipantAudioRouter
     }
 
     /// <summary>
-    /// When Graph omits <c>mediaStreams[].sourceId</c>, we only infer identity if exactly one human has no binding yet.
-    /// With two or more unmapped users, guessing (e.g. join order vs name sort) swaps speakers — we refuse and wait for Graph.
+    /// Graph often omits <c>mediaStreams[].sourceId</c> for some participants. Map unmixed <paramref name="sourceId"/>
+    /// to the roster user who is not yet tied to any source, or pair by discovery order vs sorted display names.
     /// </summary>
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
@@ -234,14 +241,34 @@ public sealed class ParticipantAudioRouter
                 return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
             }
 
-            if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
+            if (!_sourceIdDiscoveryOrder.Contains(sourceId))
             {
-                _logger.LogWarning(
-                    "Multiple roster participants have no Graph mediaStreams sourceId mapping yet; refusing to guess sourceId → user " +
-                    "(avoids swapped identities when people join close together). Audio for unmapped source ids is skipped until Graph sends mediaStreams.");
+                _sourceIdDiscoveryOrder.Add(sourceId);
             }
 
-            return false;
+            var sorted = unmappedHumans.OrderBy(h => h.DisplayName, StringComparer.OrdinalIgnoreCase).ToList();
+            var idx = _sourceIdDiscoveryOrder.IndexOf(sourceId);
+            if (idx < 0)
+            {
+                return false;
+            }
+
+            idx = Math.Min(idx, sorted.Count - 1);
+            var pick = sorted[idx];
+            _participantManager.TryBindAudioSource(sourceId, pick.AzureAdObjectId, pick.DisplayName, "InferenceHeuristic");
+            _awsTranscribeService.UpsertParticipant(pick.AzureAdObjectId, pick.DisplayName);
+            if (Interlocked.Increment(ref _loggedHeuristicMultiInference) == 1)
+            {
+                _logger.LogWarning(
+                    "Several participants lack mediaStreams sourceId in Graph. Pairing new source ids to roster users by first-seen order vs sorted display names (best-effort).");
+            }
+
+            _logger.LogDebug(
+                "Inferred sourceId {SourceId} → {DisplayName} (heuristic index {Idx}).",
+                sourceId,
+                pick.DisplayName,
+                idx);
+            return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
         }
     }
 
@@ -279,27 +306,32 @@ public sealed class ParticipantAudioRouter
             return true;
         }
 
-        // 2+ humans: never attribute mixed audio to an arbitrary roster row — that swaps identities when dominant MSI is not yet mapped.
         if (dom != none)
         {
             if (Interlocked.Increment(ref _loggedUnmappedDominantMixed) == 1)
             {
                 _logger.LogWarning(
-                    "Mixed audio: dominant sourceId {SourceId} is not bound to an Entra user yet (multiple participants). " +
-                    "Dropping frames until Graph provides mediaStreams[].sourceId for dominant speaker.",
+                    "Mixed audio: dominant sourceId {SourceId} is not bound to an Entra user yet. " +
+                    "Ensure Graph participant updates include mediaStreams with matching sourceId. " +
+                    "Using first roster participant as temporary label.",
                     dom);
             }
 
-            return false;
+            participantId = roster[0].AzureAdObjectId;
+            displayName = roster[0].DisplayName;
+            return true;
         }
 
         if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
         {
             _logger.LogWarning(
-                "Mixed audio: dominant speaker not reported yet with multiple participants; dropping frames until MSI maps to a user.");
+                "Mixed audio: dominant speaker not reported yet; labeling transcripts as {Name} until MSI arrives.",
+                roster[0].DisplayName);
         }
 
-        return false;
+        participantId = roster[0].AzureAdObjectId;
+        displayName = roster[0].DisplayName;
+        return true;
     }
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
