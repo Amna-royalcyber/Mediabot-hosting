@@ -90,6 +90,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
             var s = new TranscribeStreamService(
                 _settings,
                 _aggregator,
+                sourceId,
                 participant,
                 _loggerFactory.CreateLogger<TranscribeStreamService>());
             return s;
@@ -138,6 +139,17 @@ public sealed class TranscriptionManager : IAsyncDisposable
         _sourceIdsByUserId[userId.Trim()] = sourceIds;
         foreach (var sourceId in sourceIds)
         {
+            if (_participantBySourceId.TryGetValue(sourceId, out var existing) &&
+                !string.Equals(existing.UserId, identityRecord.UserId, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "Ignoring Graph mapping that would reassign sourceId {SourceId} from {ExistingUser} to {NewUser}.",
+                    sourceId,
+                    existing.UserId,
+                    identityRecord.UserId);
+                continue;
+            }
+
             _participantBySourceId[sourceId] = identityRecord;
             _logger.LogInformation(
                 "Mapped sourceId {SourceId} -> {DisplayName} ({UserId}).",
@@ -159,19 +171,8 @@ public sealed class TranscriptionManager : IAsyncDisposable
             return;
         }
 
-        if (!_sourceIdsByUserId.TryRemove(userId.Trim(), out var sourceIds))
-        {
-            return;
-        }
-
-        foreach (var sourceId in sourceIds)
-        {
-            _participantBySourceId.TryRemove(sourceId, out _);
-            if (_streamsBySourceId.TryRemove(sourceId, out var stream))
-            {
-                _ = stream.DisposeAsync();
-            }
-        }
+        // Drop user→source index only; keep per-sourceId identity and Transcribe streams (immutable for the call).
+        _sourceIdsByUserId.TryRemove(userId.Trim(), out _);
     }
 
     private static List<uint> TryExtractSourceIds(Microsoft.Graph.Models.Participant? participant) =>

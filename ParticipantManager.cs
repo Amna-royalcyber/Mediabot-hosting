@@ -11,13 +11,31 @@ public sealed class ParticipantInfo
     public required string ParticipantId { get; init; }
     public required string DisplayName { get; init; }
     public DateTime JoinTimestampUtc { get; init; }
-    /// <summary>Primary MSI/source id bound to this participant, if any.</summary>
     public uint? AudioStreamId { get; init; }
 }
 
 /// <summary>
-/// Global participant registry and audio source-id → participant mapping for a meeting.
-/// Placeholder ids (<see cref="IsSyntheticParticipantId"/>) may be upgraded to Entra ids when Graph sends mediaStreams.
+/// One Teams audio MSI (<see cref="SourceId"/>) → one stream identity. <see cref="StreamParticipantId"/> never changes.
+/// Graph/roster only enrich <see cref="EntraOid"/> / <see cref="DisplayName"/>; never reassign streams.
+/// </summary>
+public sealed class ParticipantBinding
+{
+    public uint SourceId { get; init; }
+
+    /// <summary>Stable internal/AWS session key: <c>msi-pending-{SourceId}</c>. Never reassigned.</summary>
+    public string StreamParticipantId { get; init; } = "";
+
+    /// <summary>Microsoft Entra object id when known (Graph or hint). May start null.</summary>
+    public string? EntraOid { get; set; }
+
+    public string DisplayName { get; set; } = "";
+
+    /// <summary>True when Graph has confirmed <see cref="EntraOid"/> (or equivalent authoritative bind).</summary>
+    public bool IsFinal { get; set; }
+}
+
+/// <summary>
+/// Global registry: <b>sourceId is the single source of truth</b>. Bind once; only enrich metadata; never reassign a stream to another user.
 /// </summary>
 public sealed class ParticipantManager
 {
@@ -35,11 +53,7 @@ public sealed class ParticipantManager
     private readonly ConcurrentDictionary<string, ParticipantInfo> _participants =
         new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>MSI/sourceId → Entra object id. Never overwritten with a different user.</summary>
-    private readonly ConcurrentDictionary<uint, string> _sourceIdToParticipantId = new();
-
-    /// <summary>When MSI is still bound to <c>msi-pending-*</c>, roster Entra oid from join-order fallback (for ALB <c>entra_id</c>).</summary>
-    private readonly ConcurrentDictionary<uint, string> _joinOrderEntraOidBySourceId = new();
+    private readonly ConcurrentDictionary<uint, ParticipantBinding> _bindings = new();
 
     private string _meetingKey = string.Empty;
 
@@ -48,20 +62,70 @@ public sealed class ParticipantManager
         _logger = logger;
     }
 
-    /// <summary>Call when a new Graph call is attached so late-join and prior mappings do not bleed across calls.</summary>
     public void BeginNewMeeting(string? callOrMeetingId)
     {
         lock (_lifecycleLock)
         {
             _meetingKey = string.IsNullOrWhiteSpace(callOrMeetingId) ? Guid.NewGuid().ToString("N") : callOrMeetingId.Trim();
             _participants.Clear();
-            _sourceIdToParticipantId.Clear();
-            _joinOrderEntraOidBySourceId.Clear();
+            _bindings.Clear();
             _logger.LogInformation("ParticipantManager reset for meeting key {MeetingKey}.", _meetingKey);
         }
     }
 
-    /// <summary>Register a human participant from Graph roster (first display name wins).</summary>
+    public bool HasBinding(uint sourceId) => _bindings.ContainsKey(sourceId);
+
+    public bool TryGetBinding(uint sourceId, out ParticipantBinding? binding) =>
+        _bindings.TryGetValue(sourceId, out binding);
+
+    /// <summary>Entra OID for ALB/SignalR: confirmed OID, else hint, else stable stream id string.</summary>
+    public string GetEntraOidForTranscript(uint sourceId)
+    {
+        if (!_bindings.TryGetValue(sourceId, out var b))
+        {
+            return SyntheticParticipantId(sourceId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(b.EntraOid))
+        {
+            return b.EntraOid.Trim();
+        }
+
+        return b.StreamParticipantId;
+    }
+
+    /// <summary>Legacy path: resolve synthetic session id to Entra/stream for payloads.</summary>
+    public string GetEntraObjectIdForTranscriptPayload(string participantId)
+    {
+        if (string.IsNullOrWhiteSpace(participantId))
+        {
+            return string.Empty;
+        }
+
+        var p = participantId.Trim();
+        if (!IsSyntheticParticipantId(p))
+        {
+            return p;
+        }
+
+        return !TryParseSourceIdFromSynthetic(p, out var sid)
+            ? p
+            : GetEntraOidForTranscript(sid);
+    }
+
+    public static bool TryParseSourceIdFromSynthetic(string? participantId, out uint sourceId)
+    {
+        sourceId = 0;
+        if (!IsSyntheticParticipantId(participantId) || participantId is null)
+        {
+            return false;
+        }
+
+        var suffix = participantId.Substring(SyntheticIdPrefix.Length);
+        return uint.TryParse(suffix, out sourceId);
+    }
+
+    /// <summary>Register a human participant from Graph roster (display cache).</summary>
     public void RegisterParticipant(string participantId, string displayName, DateTime joinTimestampUtc)
     {
         if (string.IsNullOrWhiteSpace(participantId))
@@ -85,67 +149,135 @@ public sealed class ParticipantManager
     }
 
     /// <summary>
-    /// Bind a Teams media source id to a participant id (Entra oid or synthetic placeholder).
-    /// If the source was bound to a <see cref="IsSyntheticParticipantId"/> placeholder and the new id is a real Entra user, the binding is upgraded.
+    /// Creates or enriches the binding for <paramref name="sourceId"/> only. Never reassigns
+    /// <see cref="ParticipantBinding.StreamParticipantId"/> after creation. Returns null always (no session swap).
     /// </summary>
-    /// <returns>Previous synthetic participant id whose Transcribe session should be removed after a successful Graph upgrade; otherwise null.</returns>
-    public string? TryBindAudioSource(uint sourceId, string participantId, string displayName, string reason)
+    public string? TryBindAudioSource(uint sourceId, string? participantIdOrEntraFromGraph, string displayName, string reason)
     {
-        if (string.IsNullOrWhiteSpace(participantId))
+        displayName = string.IsNullOrWhiteSpace(displayName) ? $"Speaker ({sourceId})" : displayName.Trim();
+        var graphOrAuthoritative =
+            string.Equals(reason, "Graph", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(reason, "RosterMediaStreamsMap", StringComparison.OrdinalIgnoreCase);
+
+        if (_bindings.TryGetValue(sourceId, out var existing))
         {
-            return null;
-        }
-
-        var pid = participantId.Trim();
-        displayName = string.IsNullOrWhiteSpace(displayName) ? pid : displayName.Trim();
-
-        RegisterParticipant(pid, displayName, DateTime.UtcNow);
-
-        if (_sourceIdToParticipantId.TryGetValue(sourceId, out var existingPid))
-        {
-            if (string.Equals(existingPid, pid, StringComparison.OrdinalIgnoreCase))
+            if (existing.IsFinal && !graphOrAuthoritative)
             {
                 return null;
             }
 
-            if (IsSyntheticParticipantId(existingPid) && !IsSyntheticParticipantId(pid))
+            if (graphOrAuthoritative)
             {
-                if (_sourceIdToParticipantId.TryUpdate(sourceId, pid, existingPid))
+                var incomingOid = string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph)
+                    ? null
+                    : participantIdOrEntraFromGraph.Trim();
+
+                if (!existing.IsFinal)
                 {
-                    _joinOrderEntraOidBySourceId.TryRemove(sourceId, out _);
-                    RegisterParticipant(pid, displayName, DateTime.UtcNow);
+                    if (!string.IsNullOrWhiteSpace(incomingOid))
+                    {
+                        existing.EntraOid = incomingOid;
+                        RegisterParticipant(incomingOid, displayName, DateTime.UtcNow);
+                        existing.IsFinal = true;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(displayName))
+                    {
+                        existing.DisplayName = displayName;
+                    }
+
                     _logger.LogInformation(
-                        "Upgraded sourceId {SourceId} from placeholder {OldParticipantId} to Entra user {NewParticipantId} ({Reason}).",
+                        "Enriched non-final sourceId {SourceId} from Graph/roster: EntraOid={Entra}, DisplayName={Name} [{Reason}].",
                         sourceId,
-                        existingPid,
-                        pid,
+                        existing.EntraOid,
+                        existing.DisplayName,
                         reason);
-                    return existingPid;
+                    return null;
                 }
 
+                if (!string.IsNullOrWhiteSpace(incomingOid) &&
+                    !string.IsNullOrWhiteSpace(existing.EntraOid) &&
+                    !string.Equals(existing.EntraOid, incomingOid, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning(
+                        "Conflicting Graph mapping for sourceId {SourceId}. Existing: {Existing}, Incoming: {Incoming}",
+                        sourceId,
+                        existing.EntraOid,
+                        incomingOid);
+                    return null;
+                }
+
+                if (string.IsNullOrWhiteSpace(existing.DisplayName) && !string.IsNullOrWhiteSpace(displayName))
+                {
+                    existing.DisplayName = displayName;
+                }
                 return null;
             }
 
-            _logger.LogWarning(
-                "Ignoring {Reason} bind for sourceId {SourceId} → {NewParticipantId}; already bound to {ExistingParticipantId}.",
+            if (!existing.IsFinal &&
+                (string.Equals(reason, "JoinOrderDisplayFallback", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(reason, "JoinOrderDisplayFallbackMixed", StringComparison.OrdinalIgnoreCase)))
+            {
+                if (!string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph))
+                {
+                    existing.EntraOid = participantIdOrEntraFromGraph.Trim();
+                }
+
+                existing.DisplayName = displayName;
+                _logger.LogDebug("Join-order hint applied to existing non-final binding for sourceId {SourceId}.", sourceId);
+                return null;
+            }
+
+            _logger.LogDebug(
+                "Ignoring {Reason} for sourceId {SourceId}; binding already exists (IsFinal={IsFinal}).",
                 reason,
                 sourceId,
-                pid,
-                existingPid);
-
+                existing.IsFinal);
             return null;
         }
 
-        if (!_sourceIdToParticipantId.TryAdd(sourceId, pid))
+        // First bind only — hard block reassignment is implicit (key did not exist).
+        var streamPid = SyntheticParticipantId(sourceId);
+        var binding = new ParticipantBinding
         {
-            return null;
+            SourceId = sourceId,
+            StreamParticipantId = streamPid,
+            DisplayName = displayName
+        };
+
+        var initialGraphOid = string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph)
+            ? null
+            : participantIdOrEntraFromGraph.Trim();
+        if (graphOrAuthoritative && !string.IsNullOrWhiteSpace(initialGraphOid))
+        {
+            binding.EntraOid = initialGraphOid;
+            RegisterParticipant(binding.EntraOid, displayName, DateTime.UtcNow);
+            binding.IsFinal = true;
         }
+        else if (string.Equals(reason, "JoinOrderDisplayFallback", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(reason, "JoinOrderDisplayFallbackMixed", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph))
+            {
+                binding.EntraOid = participantIdOrEntraFromGraph.Trim();
+            }
+
+            binding.IsFinal = false;
+        }
+        else
+        {
+            binding.IsFinal = false;
+        }
+
+        RegisterParticipant(streamPid, binding.DisplayName, DateTime.UtcNow);
+        _bindings[sourceId] = binding;
 
         _logger.LogInformation(
-            "Bound audio sourceId {SourceId} → {DisplayName} ({ParticipantId}) [{Reason}].",
+            "Created binding sourceId {SourceId} → stream {StreamId}; EntraOid={Entra}; IsFinal={Final} [{Reason}].",
             sourceId,
-            GetCanonicalDisplayName(pid) ?? displayName,
-            pid,
+            streamPid,
+            binding.EntraOid,
+            binding.IsFinal,
             reason);
 
         return null;
@@ -155,66 +287,16 @@ public sealed class ParticipantManager
     {
         participantId = string.Empty;
         displayName = string.Empty;
-        if (!_sourceIdToParticipantId.TryGetValue(sourceId, out var pid))
+        if (!_bindings.TryGetValue(sourceId, out var b))
         {
             return false;
         }
 
-        participantId = pid;
-        displayName = GetCanonicalDisplayName(pid) ?? pid;
+        participantId = b.StreamParticipantId;
+        displayName = string.IsNullOrWhiteSpace(b.DisplayName) ? participantId : b.DisplayName;
         return true;
     }
 
-    /// <summary>Records roster Entra oid for join-order display fallback (MSI still synthetic until Graph upgrades).</summary>
-    public void SetJoinOrderEntraHint(uint sourceId, string entraObjectId)
-    {
-        if (string.IsNullOrWhiteSpace(entraObjectId))
-        {
-            return;
-        }
-
-        _joinOrderEntraOidBySourceId[sourceId] = entraObjectId.Trim();
-    }
-
-    /// <summary>
-    /// Entra object id for transcript payloads: real oid when bound or join-order hint; otherwise synthetic id string.
-    /// </summary>
-    public string GetEntraObjectIdForTranscriptPayload(string participantId)
-    {
-        if (string.IsNullOrWhiteSpace(participantId))
-        {
-            return string.Empty;
-        }
-
-        var p = participantId.Trim();
-        if (!IsSyntheticParticipantId(p))
-        {
-            return p;
-        }
-
-        if (!TryParseSourceIdFromSynthetic(p, out var sid))
-        {
-            return p;
-        }
-
-        return _joinOrderEntraOidBySourceId.TryGetValue(sid, out var oid) && !string.IsNullOrWhiteSpace(oid)
-            ? oid.Trim()
-            : p;
-    }
-
-    public static bool TryParseSourceIdFromSynthetic(string? participantId, out uint sourceId)
-    {
-        sourceId = 0;
-        if (!IsSyntheticParticipantId(participantId) || participantId is null)
-        {
-            return false;
-        }
-
-        var suffix = participantId.Substring(SyntheticIdPrefix.Length);
-        return uint.TryParse(suffix, out sourceId);
-    }
-
-    /// <summary>Canonical display name for transcripts (Teams/Entra only; first registered wins).</summary>
     public string? GetCanonicalDisplayName(string participantId)
     {
         if (string.IsNullOrWhiteSpace(participantId))
@@ -222,16 +304,42 @@ public sealed class ParticipantManager
             return null;
         }
 
-        return _participants.TryGetValue(participantId.Trim(), out var info) ? info.DisplayName : null;
+        var p = participantId.Trim();
+        if (TryParseSourceIdFromSynthetic(p, out var sid) &&
+            _bindings.TryGetValue(sid, out var b) &&
+            !string.IsNullOrWhiteSpace(b.DisplayName))
+        {
+            return b.DisplayName;
+        }
+
+        return _participants.TryGetValue(p, out var info) ? info.DisplayName : null;
     }
 
     public bool HasParticipant(string participantId) =>
         !string.IsNullOrWhiteSpace(participantId) &&
         _participants.ContainsKey(participantId.Trim());
 
-    /// <summary>Entra user ids that already have at least one MSI/sourceId bound (used for inference).</summary>
     public HashSet<string> GetParticipantIdsWithAudioSourceBindings()
     {
-        return new HashSet<string>(_sourceIdToParticipantId.Values, StringComparer.OrdinalIgnoreCase);
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var b in _bindings.Values)
+        {
+            if (!string.IsNullOrWhiteSpace(b.EntraOid))
+            {
+                set.Add(b.EntraOid);
+            }
+        }
+
+        return set;
+    }
+
+    public void SetJoinOrderEntraHint(uint sourceId, string entraObjectId)
+    {
+        if (string.IsNullOrWhiteSpace(entraObjectId) || !_bindings.TryGetValue(sourceId, out var b) || b.IsFinal)
+        {
+            return;
+        }
+
+        b.EntraOid = entraObjectId.Trim();
     }
 }

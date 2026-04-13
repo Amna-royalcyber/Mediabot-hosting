@@ -25,6 +25,13 @@ public sealed class TranscriptionChunk
     public required List<TranscriptItem> Items { get; init; }
 }
 
+public sealed class TimeWindowChunk
+{
+    public required DateTime StartTime { get; init; }
+    public required DateTime EndTime { get; init; }
+    public required List<TranscriptItem> Fragments { get; init; }
+}
+
 /// <summary>
 /// Strict wall-clock 3-minute windows from call anchor. No cross-chunk duplication; each final transcript item once per dedupe key.
 /// </summary>
@@ -32,9 +39,9 @@ public sealed class TranscriptionChunkManager : BackgroundService
 {
     private static readonly TimeSpan ChunkDuration = TimeSpan.FromMinutes(3);
 
-    /// <summary>3-minute ALB chunk: <c>length_limit_reached - 0</c> if any transcript text; <c>long_times_of_silence - 1</c> if none.</summary>
-    private const string AlbFlagLengthLimitReached = "length_limit_reached - 0";
-    private const string AlbFlagLongSilence = "long_times_of_silence - 1";
+    private const string AlbFlagLengthLimitReached = "0";
+    private const string AlbFlagLongSilence = "1";
+    private const string AlbFlagTimerUpdate = "2";
 
     private readonly BotSettings _settings;
     private readonly MeetingContextStore _meetingContext;
@@ -44,10 +51,9 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
     private readonly object _lock = new();
     private int _anchorOnce;
-    private DateTime _anchorUtc;
+    private DateTime _meetingStartTimeUtc;
     private bool _hasAnchor;
-    private int _activeChunkIndex;
-    private readonly List<TranscriptItem> _buffer = new();
+    private TimeWindowChunk? _currentWindow;
     private readonly HashSet<string> _dedupeKeys = new(StringComparer.Ordinal);
 
     public TranscriptionChunkManager(
@@ -71,8 +77,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
         lock (_lock)
         {
             _hasAnchor = false;
-            _activeChunkIndex = 0;
-            _buffer.Clear();
+            _currentWindow = null;
             _dedupeKeys.Clear();
         }
     }
@@ -87,12 +92,11 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
         lock (_lock)
         {
-            _anchorUtc = anchorUtc.Kind == DateTimeKind.Utc ? anchorUtc : anchorUtc.ToUniversalTime();
+            _meetingStartTimeUtc = anchorUtc.Kind == DateTimeKind.Utc ? anchorUtc : anchorUtc.ToUniversalTime();
             _hasAnchor = true;
-            _activeChunkIndex = 0;
-            _buffer.Clear();
+            _currentWindow = CreateNewWindow(_meetingStartTimeUtc);
             _dedupeKeys.Clear();
-            _logger.LogInformation("Transcription chunk anchor set to {AnchorUtc} (UTC).", _anchorUtc);
+            _logger.LogInformation("Transcription chunk anchor set to {AnchorUtc} (UTC).", _meetingStartTimeUtc);
         }
     }
 
@@ -102,7 +106,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
         lock (_lock)
         {
             _hasAnchor = false;
-            _buffer.Clear();
+            _currentWindow = null;
             _dedupeKeys.Clear();
         }
     }
@@ -114,6 +118,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
         string speakerName,
         string text,
         string dedupeKey,
+        uint? sourceStreamId = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(_settings.TranscriptAlbEndpoint))
@@ -128,41 +133,24 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
         var utc = utteranceUtc.Kind == DateTimeKind.Utc ? utteranceUtc : utteranceUtc.ToUniversalTime();
 
-        List<TranscriptionChunk>? toSend = null;
+        List<TimeWindowChunk>? windowsToFlush = null;
         lock (_lock)
         {
-            if (!_hasAnchor)
+            if (!_hasAnchor || _currentWindow is null)
             {
                 return;
             }
 
-            if (utc < _anchorUtc)
+            if (utc < _meetingStartTimeUtc)
             {
-                utc = _anchorUtc;
+                utc = _meetingStartTimeUtc;
             }
 
-            var idx = (int)Math.Floor((utc - _anchorUtc).TotalMilliseconds / ChunkDuration.TotalMilliseconds);
-            if (idx < 0)
+            while (utc >= _currentWindow.EndTime)
             {
-                idx = 0;
-            }
-
-            if (idx < _activeChunkIndex)
-            {
-                _logger.LogDebug(
-                    "Dropping late transcript for chunk {ChunkIndex} (active={Active}); dedupe={Key}.",
-                    idx,
-                    _activeChunkIndex,
-                    dedupeKey);
-                return;
-            }
-
-            while (_activeChunkIndex < idx)
-            {
-                toSend ??= new List<TranscriptionChunk>();
-                toSend.Add(BuildChunkToSend(_activeChunkIndex, takeBuffer: true));
-                _activeChunkIndex++;
-                _buffer.Clear();
+                windowsToFlush ??= new List<TimeWindowChunk>();
+                windowsToFlush.Add(_currentWindow);
+                _currentWindow = CreateNewWindow(_currentWindow.EndTime);
                 _dedupeKeys.Clear();
             }
 
@@ -171,20 +159,24 @@ public sealed class TranscriptionChunkManager : BackgroundService
                 return;
             }
 
-            _buffer.Add(new TranscriptItem
+            var entraForAlb = sourceStreamId is uint sid
+                ? _participantManager.GetEntraOidForTranscript(sid)
+                : _participantManager.GetEntraObjectIdForTranscriptPayload(participantId);
+
+            _currentWindow.Fragments.Add(new TranscriptItem
             {
                 Timestamp = utc,
-                EntraObjectId = _participantManager.GetEntraObjectIdForTranscriptPayload(participantId),
+                EntraObjectId = entraForAlb,
                 ParticipantName = speakerName.Trim(),
                 Text = text.Trim()
             });
         }
 
-        if (toSend is not null)
+        if (windowsToFlush is not null)
         {
-            foreach (var chunk in toSend)
+            foreach (var window in windowsToFlush)
             {
-                await PostChunkAsync(chunk, cancellationToken);
+                await FlushWindowAsync(window, flag: null, cancellationToken);
             }
         }
     }
@@ -202,56 +194,46 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
             while (true)
             {
-                TranscriptionChunk? chunk = null;
+                TimeWindowChunk? windowToFlush = null;
                 lock (_lock)
                 {
-                    if (!_hasAnchor)
+                    if (!_hasAnchor || _currentWindow is null)
                     {
                         break;
                     }
 
                     var now = DateTime.UtcNow;
-                    var wallIdx = (int)Math.Floor((now - _anchorUtc).TotalMilliseconds / ChunkDuration.TotalMilliseconds);
-                    if (wallIdx < 0)
-                    {
-                        wallIdx = 0;
-                    }
-
-                    if (wallIdx <= _activeChunkIndex)
+                    if (now < _currentWindow.EndTime)
                     {
                         break;
                     }
 
-                    chunk = BuildChunkToSend(_activeChunkIndex, takeBuffer: true);
-                    _activeChunkIndex++;
-                    _buffer.Clear();
+                    windowToFlush = _currentWindow;
+                    _currentWindow = CreateNewWindow(_currentWindow.EndTime);
                     _dedupeKeys.Clear();
                 }
 
-                if (chunk is null)
+                if (windowToFlush is null)
                 {
                     break;
                 }
 
-                await PostChunkAsync(chunk, stoppingToken);
+                await FlushWindowAsync(windowToFlush, flag: null, stoppingToken);
             }
         }
     }
 
-    private TranscriptionChunk BuildChunkToSend(int chunkIndex, bool takeBuffer)
+    private static TimeWindowChunk CreateNewWindow(DateTime startUtc)
     {
-        var start = _anchorUtc + TimeSpan.FromTicks(ChunkDuration.Ticks * chunkIndex);
-        var end = start + ChunkDuration;
-        var items = takeBuffer ? new List<TranscriptItem>(_buffer) : new List<TranscriptItem>();
-        return new TranscriptionChunk
+        return new TimeWindowChunk
         {
-            StartTime = start,
-            EndTime = end,
-            Items = items
+            StartTime = startUtc,
+            EndTime = startUtc.Add(ChunkDuration),
+            Fragments = new List<TranscriptItem>()
         };
     }
 
-    private async Task PostChunkAsync(TranscriptionChunk chunk, CancellationToken cancellationToken)
+    private async Task FlushWindowAsync(TimeWindowChunk window, string? flag, CancellationToken cancellationToken)
     {
         var endpoint = _settings.TranscriptAlbEndpoint;
         if (string.IsNullOrWhiteSpace(endpoint))
@@ -259,19 +241,26 @@ public sealed class TranscriptionChunkManager : BackgroundService
             return;
         }
 
-        var ordered = chunk.Items.OrderBy(i => i.Timestamp).ToList();
+        var ordered = window.Fragments.OrderBy(i => i.Timestamp).ToList();
+        var transcriptList = new List<Dictionary<string, string>>();
+        foreach (var fragment in ordered)
+        {
+            if (string.IsNullOrWhiteSpace(fragment.Text))
+            {
+                continue;
+            }
+
+            transcriptList.Add(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [fragment.ParticipantName] = fragment.Text.Trim()
+            });
+        }
+
         var payload = new AlbChunkPayload
         {
             MeetingId = _meetingContext.CurrentMeetingId,
-            Transcript = ordered
-                .Select(i => new AlbTranscriptEntry
-                {
-                    EntraId = i.EntraObjectId,
-                    Name = i.ParticipantName,
-                    Text = i.Text
-                })
-                .ToList(),
-            Flag = ResolveAlbFlag(ordered)
+            Transcript = transcriptList,
+            Flag = flag ?? ResolveAlbFlag(transcriptList.Count)
         };
 
         try
@@ -295,9 +284,9 @@ public sealed class TranscriptionChunkManager : BackgroundService
                     (int)response.StatusCode,
                     payload.MeetingId,
                     payload.Flag,
-                    chunk.StartTime,
-                    chunk.EndTime,
-                    chunk.Items.Count);
+                    window.StartTime,
+                    window.EndTime,
+                    window.Fragments.Count);
                 return;
             }
 
@@ -305,20 +294,23 @@ public sealed class TranscriptionChunkManager : BackgroundService
                 "Posted transcript chunk to ALB. MeetingId={MeetingId}, Flag={Flag}, Start={Start}, End={End}, Lines={Count}.",
                 payload.MeetingId,
                 payload.Flag,
-                chunk.StartTime,
-                chunk.EndTime,
-                chunk.Items.Count);
+                window.StartTime,
+                window.EndTime,
+                window.Fragments.Count);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "ALB chunk post error for window {Start}–{End}.", chunk.StartTime, chunk.EndTime);
+            _logger.LogError(ex, "ALB chunk post error for window {Start}–{End}.", window.StartTime, window.EndTime);
+        }
+        finally
+        {
+            window.Fragments.Clear();
         }
     }
 
-    private static string ResolveAlbFlag(IReadOnlyList<TranscriptItem> items)
+    private static string ResolveAlbFlag(int transcriptCount)
     {
-        var hasText = items.Any(i => !string.IsNullOrWhiteSpace(i.Text));
-        return hasText ? AlbFlagLengthLimitReached : AlbFlagLongSilence;
+        return transcriptCount == 0 ? AlbFlagLongSilence : AlbFlagLengthLimitReached;
     }
 
     private sealed class AlbChunkPayload
@@ -327,21 +319,9 @@ public sealed class TranscriptionChunkManager : BackgroundService
         public string MeetingId { get; set; } = string.Empty;
 
         [JsonPropertyName("transcript")]
-        public List<AlbTranscriptEntry> Transcript { get; set; } = new();
+        public List<Dictionary<string, string>> Transcript { get; set; } = new();
 
         [JsonPropertyName("flag")]
         public string Flag { get; set; } = string.Empty;
-    }
-
-    private sealed class AlbTranscriptEntry
-    {
-        [JsonPropertyName("entra_id")]
-        public string EntraId { get; set; } = string.Empty;
-
-        [JsonPropertyName("name")]
-        public string Name { get; set; } = string.Empty;
-
-        [JsonPropertyName("text")]
-        public string Text { get; set; } = string.Empty;
     }
 }

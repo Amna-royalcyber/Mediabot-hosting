@@ -30,11 +30,14 @@ public sealed class TranscriptBroadcaster
         string? awsSpeakerId = null,
         string? speakerLabel = null,
         string? userPrincipalName = null,
-        string? azureAdObjectId = null)
+        string? azureAdObjectId = null,
+        uint? sourceStreamId = null)
     {
-        var entraForClients = string.IsNullOrWhiteSpace(azureAdObjectId)
-            ? azureAdObjectId
-            : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId);
+        var entraForClients = sourceStreamId is uint sid
+            ? _participantManager.GetEntraOidForTranscript(sid)
+            : (string.IsNullOrWhiteSpace(azureAdObjectId)
+                ? azureAdObjectId
+                : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId));
         try
         {
             await _hubContext.Clients.All.SendAsync("transcript", new
@@ -56,20 +59,21 @@ public sealed class TranscriptBroadcaster
         if (!string.Equals(kind, "Final", StringComparison.OrdinalIgnoreCase) ||
             string.IsNullOrWhiteSpace(text) ||
             string.IsNullOrWhiteSpace(speakerLabel) ||
-            string.IsNullOrWhiteSpace(azureAdObjectId))
+            (string.IsNullOrWhiteSpace(azureAdObjectId) && sourceStreamId is null))
         {
             return;
         }
 
-        var dedupeKey = $"{azureAdObjectId}|{audioTimestampHns.ToString(System.Globalization.CultureInfo.InvariantCulture)}|{text}";
+        var dedupeKey = $"{sourceStreamId?.ToString() ?? azureAdObjectId}|{audioTimestampHns.ToString(System.Globalization.CultureInfo.InvariantCulture)}|{text}";
         try
         {
             await _chunkManager.RecordFinalAsync(
                 utteranceUtc,
-                azureAdObjectId,
+                azureAdObjectId ?? string.Empty,
                 speakerLabel,
                 text,
-                dedupeKey);
+                dedupeKey,
+                sourceStreamId);
         }
         catch (Exception ex)
         {

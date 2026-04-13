@@ -24,22 +24,19 @@ public sealed class ParticipantAudioRouter
     /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
     private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
 
-    /// <summary>Last non-<see cref="DominantSpeakerChangedEventArgs.None"/> dominant MSI (Teams sometimes reports None between packets).</summary>
-    private uint _lastNonNoneDominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
-
     private ICall? _attachedCall;
     private string _botClientId = string.Empty;
     private readonly object _rescanLock = new();
     private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
 
     private int _loggedMixedMode;
-    private int _loggedUnmappedDominantMixed;
     private int _loggedDominantNotYetMixed;
     private int _loggedMultiParticipantInferenceSkipped;
 
     private readonly object _inferLock = new();
 
     private readonly ConcurrentDictionary<uint, byte> _warnedUnmappedSourceIds = new();
+    private readonly ConcurrentDictionary<uint, byte> _activeSourceIds = new();
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
@@ -63,7 +60,7 @@ public sealed class ParticipantAudioRouter
         _botClientId = botClientId ?? string.Empty;
         var none = (uint)DominantSpeakerChangedEventArgs.None;
         _dominantSourceId = none;
-        _lastNonNoneDominantSourceId = none;
+        _activeSourceIds.Clear();
         lock (_rescanLock)
         {
             _lastParticipantRescanUtc = DateTime.MinValue;
@@ -129,6 +126,7 @@ public sealed class ParticipantAudioRouter
             {
                 continue;
             }
+            _activeSourceIds[sourceId] = 0;
 
             if (!_participantManager.TryResolveAudioSource(sourceId, out var participantId, out var displayName))
             {
@@ -162,7 +160,7 @@ public sealed class ParticipantAudioRouter
 
             _logger.LogDebug("Audio received from {ParticipantName} ({ParticipantId}).", displayName, participantId);
             await _awsTranscribeService.SendAudioChunkAsync(
-                participantId,
+                sourceId,
                 displayName,
                 pcm,
                 ub.OriginalSenderTimestamp);
@@ -201,7 +199,11 @@ public sealed class ParticipantAudioRouter
             return;
         }
 
-        if (!TryResolveMixedAttribution(roster, out var mixedParticipantId, out var mixedDisplayName))
+        if (!TryResolveMixedAttribution(
+                roster,
+                out var mixedSourceId,
+                out var mixedDisplayName,
+                out var mixedUserIdWhenNoStream))
         {
             return;
         }
@@ -214,8 +216,9 @@ public sealed class ParticipantAudioRouter
         }
 
         await _awsTranscribeService.SendMixedDominantAudioAsync(
-            mixedParticipantId,
+            mixedSourceId,
             mixedDisplayName,
+            mixedUserIdWhenNoStream,
             pcm,
             args.Buffer.Timestamp);
     }
@@ -224,10 +227,9 @@ public sealed class ParticipantAudioRouter
     public void SetDominantSpeaker(uint sourceId)
     {
         _dominantSourceId = sourceId;
-        var none = (uint)DominantSpeakerChangedEventArgs.None;
-        if (sourceId != none)
+        if (sourceId != (uint)DominantSpeakerChangedEventArgs.None)
         {
-            _lastNonNoneDominantSourceId = sourceId;
+            _activeSourceIds[sourceId] = 0;
         }
     }
 
@@ -281,12 +283,7 @@ public sealed class ParticipantAudioRouter
 
         lock (_inferLock)
         {
-            var removed = _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
-            if (removed is not null)
-            {
-                _awsTranscribeService.RemoveParticipant(removed);
-            }
-
+            _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
             _awsTranscribeService.UpsertParticipant(oid, dn);
             return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
         }
@@ -351,20 +348,13 @@ public sealed class ParticipantAudioRouter
             }
 
             if (_settings.MsiToRosterJoinOrderFallback &&
-                TryAllocateJoinOrderRosterNoLock(sourceId, roster, out _, out var fjDn))
+                TryAllocateJoinOrderRosterNoLock(sourceId, roster, out var fjPid, out var fjDn))
             {
-                var synId = ParticipantManager.SyntheticParticipantId(sourceId);
-                var removedFj = _participantManager.TryBindAudioSource(sourceId, synId, fjDn, "JoinOrderDisplayFallback");
-                if (removedFj is not null)
-                {
-                    _awsTranscribeService.RemoveParticipant(removedFj);
-                }
-
-                _awsTranscribeService.UpsertParticipant(synId, fjDn);
+                _participantManager.TryBindAudioSource(sourceId, fjPid, fjDn, "JoinOrderDisplayFallback");
+                _awsTranscribeService.UpsertParticipant(fjPid, fjDn);
                 return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
             }
 
-            var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
             var syntheticName = $"Speaker ({sourceId})";
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
@@ -372,13 +362,7 @@ public sealed class ParticipantAudioRouter
                     "Graph has not mapped mediaStreams for some streams yet; using per-source placeholders until Entra mappings arrive (set Bot:MsiToRosterJoinOrderFallback=true for Entra names by join order).");
             }
 
-            var removedPlaceholder = _participantManager.TryBindAudioSource(sourceId, syntheticId, syntheticName, "SyntheticUntilGraph");
-            if (removedPlaceholder is not null)
-            {
-                _awsTranscribeService.RemoveParticipant(removedPlaceholder);
-            }
-
-            _awsTranscribeService.UpsertParticipant(syntheticId, syntheticName);
+            _participantManager.TryBindAudioSource(sourceId, null, syntheticName, "SyntheticUntilGraph");
             return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
         }
     }
@@ -393,86 +377,64 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    private bool TryResolveMixedAttribution(IReadOnlyList<RosterParticipantDto> roster, out string participantId, out string displayName)
+    /// <summary>
+    /// Resolves mixed-audio attribution with strict determinism:
+    /// only when exactly one active sourceId is known. Otherwise emit unknown (no source assignment).
+    /// </summary>
+    private bool TryResolveMixedAttribution(
+        IReadOnlyList<RosterParticipantDto> roster,
+        out uint? sourceStreamId,
+        out string displayName,
+        out string? userIdWhenNoSourceStream)
     {
-        participantId = string.Empty;
+        sourceStreamId = null;
         displayName = string.Empty;
-        var none = (uint)DominantSpeakerChangedEventArgs.None;
-        var dom = _dominantSourceId;
-        if (dom == none && _lastNonNoneDominantSourceId != none)
+        userIdWhenNoSourceStream = null;
+        _ = roster;
+        var activeSources = GetActiveSourceIds();
+        if (activeSources.Count != 1)
         {
-            dom = _lastNonNoneDominantSourceId;
-        }
-
-        if (dom != none && _participantManager.TryResolveAudioSource(dom, out participantId, out displayName))
-        {
-            return true;
-        }
-
-        if (dom != none && TryApplyRosterMediaStreamMap(dom, out participantId, out displayName))
-        {
-            return true;
-        }
-
-        if (roster.Count == 0)
-        {
+            if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
+            {
+                _logger.LogWarning(
+                    "Mixed audio has {ActiveCount} active sourceIds; attribution disabled to prevent identity guessing.",
+                    activeSources.Count);
+            }
             return false;
         }
 
-        if (roster.Count == 1)
+        var onlySourceId = activeSources[0];
+        if (_participantManager.TryResolveAudioSource(onlySourceId, out _, out displayName))
         {
-            participantId = roster[0].AzureAdObjectId;
-            displayName = roster[0].DisplayName;
+            sourceStreamId = onlySourceId;
             return true;
         }
 
-        // 2+ humans, dominant MSI known but not yet mapped to Entra: join-order fallback or per-MSI placeholder.
-        if (dom != none)
+        if (TryApplyRosterMediaStreamMap(onlySourceId, out _, out displayName))
         {
-            lock (_inferLock)
-            {
-                if (_settings.MsiToRosterJoinOrderFallback &&
-                    TryAllocateJoinOrderRosterNoLock(dom, roster, out _, out var fjDn))
-                {
-                    var synId = ParticipantManager.SyntheticParticipantId(dom);
-                    var removedFj = _participantManager.TryBindAudioSource(dom, synId, fjDn, "JoinOrderDisplayFallbackMixed");
-                    if (removedFj is not null)
-                    {
-                        _awsTranscribeService.RemoveParticipant(removedFj);
-                    }
-
-                    _awsTranscribeService.UpsertParticipant(synId, fjDn);
-                    return _participantManager.TryResolveAudioSource(dom, out participantId, out displayName);
-                }
-
-                if (Interlocked.Increment(ref _loggedUnmappedDominantMixed) == 1)
-                {
-                    _logger.LogInformation(
-                        "Mixed audio: dominant sourceId {SourceId} not mapped to Entra yet (multiple participants). " +
-                        "Using placeholder label until Graph sends mediaStreams.",
-                        dom);
-                }
-
-                var syntheticId = ParticipantManager.SyntheticParticipantId(dom);
-                var syntheticName = $"Speaker ({dom})";
-                var removedPh = _participantManager.TryBindAudioSource(dom, syntheticId, syntheticName, "SyntheticDominantMixed");
-                if (removedPh is not null)
-                {
-                    _awsTranscribeService.RemoveParticipant(removedPh);
-                }
-
-                _awsTranscribeService.UpsertParticipant(syntheticId, syntheticName);
-                return _participantManager.TryResolveAudioSource(dom, out participantId, out displayName);
-            }
+            sourceStreamId = onlySourceId;
+            return true;
         }
 
-        if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
+        _participantManager.TryBindAudioSource(onlySourceId, null, $"Speaker ({onlySourceId})", "SyntheticDominantMixed");
+        if (_participantManager.TryResolveAudioSource(onlySourceId, out _, out displayName))
         {
-            _logger.LogWarning(
-                "Mixed audio: dominant speaker not reported yet with multiple participants; dropping frames until MSI maps to a user.");
+            sourceStreamId = onlySourceId;
+            return true;
         }
 
         return false;
+    }
+
+    private List<uint> GetActiveSourceIds()
+    {
+        var ids = _activeSourceIds.Keys.ToList();
+        var dom = _dominantSourceId;
+        if (dom != (uint)DominantSpeakerChangedEventArgs.None && !ids.Contains(dom))
+        {
+            ids.Add(dom);
+        }
+        return ids;
     }
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
@@ -504,12 +466,7 @@ public sealed class ParticipantAudioRouter
 
         foreach (var sourceId in GraphParticipantMediaStreams.ExtractSourceIds(resource))
         {
-            var removedSyn = _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
-            if (removedSyn is not null)
-            {
-                _awsTranscribeService.RemoveParticipant(removedSyn);
-            }
-
+            _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
             _logger.LogInformation("Bound sourceId {SourceId} -> {DisplayName} ({ParticipantId}).", sourceId, dn, pid);
         }
 
@@ -518,13 +475,8 @@ public sealed class ParticipantAudioRouter
 
     private void RemoveParticipantMappings(IParticipant participant)
     {
-        var participantId = participant.Resource?.Info?.Identity?.User?.Id;
-        if (string.IsNullOrWhiteSpace(participantId))
-        {
-            return;
-        }
-
-        _awsTranscribeService.RemoveParticipant(participantId.Trim());
+        // AWS Transcribe sessions are keyed by immutable sourceId; do not tear down streams on roster leave
+        // (avoids identity churn and matches bind-once semantics).
     }
 
     private static byte[] CopyUnmixedBuffer(IntPtr ptr, long length)

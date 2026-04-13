@@ -8,12 +8,12 @@ using Microsoft.Extensions.Logging;
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Manages AWS Transcribe streaming: one session per participant when unmixed audio is available,
+/// Manages AWS Transcribe streaming: one session per <c>sourceId</c> (MSI) when unmixed audio is available,
 /// and one optional "dominant mixed" session when only the main (mixed) buffer is present.
 /// </summary>
 public sealed class AwsTranscribeService : IAsyncDisposable
 {
-    /// <summary>Single session used for mixed meeting audio; identity is updated per chunk from Teams dominant speaker.</summary>
+    /// <summary>Session key for logs only; transcripts use <see cref="TranscriptFragment.SourceStreamId"/> or roster fallback.</summary>
     public const string DominantMixedSessionKey = "__dominant_mixed__";
 
     private readonly BotSettings _settings;
@@ -21,8 +21,9 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private readonly ParticipantManager _participantManager;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<AwsTranscribeService> _logger;
-    private readonly ConcurrentDictionary<string, ParticipantTranscribeSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, string> _displayNames = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<uint, ParticipantTranscribeSession> _sessionsBySourceId = new();
+    private readonly object _mixedLock = new();
+    private ParticipantTranscribeSession? _mixedDominantSession;
 
     public AwsTranscribeService(
         BotSettings settings,
@@ -38,6 +39,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         _logger = logger;
     }
 
+    /// <summary>Roster display cache only; does not create or move Transcribe sessions (sessions are per <c>sourceId</c>).</summary>
     public void UpsertParticipant(string participantId, string displayName)
     {
         if (string.IsNullOrWhiteSpace(participantId))
@@ -45,30 +47,21 @@ public sealed class AwsTranscribeService : IAsyncDisposable
             return;
         }
 
-        var pid = participantId.Trim();
-        _participantManager.RegisterParticipant(pid, displayName, DateTime.UtcNow);
-        var canonical = _participantManager.GetCanonicalDisplayName(pid) ?? displayName.Trim();
-        _displayNames[pid] = canonical;
-        if (_sessions.TryGetValue(pid, out var session))
-        {
-            session.UpdateDisplayName(canonical);
-        }
+        _participantManager.RegisterParticipant(participantId.Trim(), displayName, DateTime.UtcNow);
     }
 
-    public async Task SendAudioChunkAsync(string participantId, string displayName, byte[] pcmAudio, long timestamp)
+    public async Task SendAudioChunkAsync(uint sourceId, string displayName, byte[] pcmAudio, long timestamp)
     {
         if (pcmAudio.Length == 0)
         {
             return;
         }
 
-        UpsertParticipant(participantId, displayName);
-
-        var session = _sessions.GetOrAdd(participantId, _ =>
-            new ParticipantTranscribeSession(
+        var session = _sessionsBySourceId.GetOrAdd(
+            sourceId,
+            _ => new ParticipantTranscribeSession(
                 _settings,
-                participantId,
-                displayName,
+                fixedSourceStreamId: sourceId,
                 _transcriptAggregator,
                 _participantManager,
                 _loggerFactory.CreateLogger<ParticipantTranscribeSession>()));
@@ -78,50 +71,55 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends PCM from the main (mixed) buffer to one Transcribe stream. Call
-    /// <see cref="ParticipantTranscribeSession.UpdateTranscriptIdentity"/> before each chunk so transcripts use the current speaker (Teams dominant MSI → Entra user).
+    /// Sends PCM from the main (mixed) buffer to one Transcribe stream. Identity per utterance comes from
+    /// <paramref name="sourceStreamId"/> when known, else <paramref name="userIdWhenNoSourceStream"/> (e.g. sole roster Entra id).
     /// </summary>
-    public async Task SendMixedDominantAudioAsync(string participantId, string displayName, byte[] pcmAudio, long timestamp)
+    public async Task SendMixedDominantAudioAsync(
+        uint? sourceStreamId,
+        string displayName,
+        string? userIdWhenNoSourceStream,
+        byte[] pcmAudio,
+        long timestamp)
     {
         if (pcmAudio.Length == 0)
         {
             return;
         }
 
-        UpsertParticipant(DominantMixedSessionKey, displayName);
+        lock (_mixedLock)
+        {
+            if (_mixedDominantSession is null)
+            {
+                _mixedDominantSession = new ParticipantTranscribeSession(
+                    _settings,
+                    fixedSourceStreamId: null,
+                    _transcriptAggregator,
+                    _participantManager,
+                    _loggerFactory.CreateLogger<ParticipantTranscribeSession>());
+            }
 
-        var session = _sessions.GetOrAdd(
-            DominantMixedSessionKey,
-            _ => new ParticipantTranscribeSession(
-                _settings,
-                DominantMixedSessionKey,
-                displayName,
-                _transcriptAggregator,
-                _participantManager,
-                _loggerFactory.CreateLogger<ParticipantTranscribeSession>()));
+            _mixedDominantSession.UpdateMixedDominantContext(sourceStreamId, displayName, userIdWhenNoSourceStream);
+        }
 
-        session.UpdateTranscriptIdentity(participantId, displayName);
+        var session = _mixedDominantSession ?? throw new InvalidOperationException("Mixed session not initialized.");
         await session.EnsureStartedAsync();
         session.EnqueueAudio(pcmAudio, timestamp);
     }
 
-    public void RemoveParticipant(string participantId)
-    {
-        _displayNames.TryRemove(participantId, out _);
-        if (_sessions.TryRemove(participantId, out var session))
-        {
-            _ = session.DisposeAsync();
-        }
-    }
-
     public async ValueTask DisposeAsync()
     {
-        foreach (var session in _sessions.Values)
+        foreach (var session in _sessionsBySourceId.Values)
         {
             await session.DisposeAsync();
         }
 
-        _sessions.Clear();
+        _sessionsBySourceId.Clear();
+
+        if (_mixedDominantSession is not null)
+        {
+            await _mixedDominantSession.DisposeAsync();
+            _mixedDominantSession = null;
+        }
     }
 }
 
@@ -132,14 +130,16 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
     private readonly ParticipantManager _participantManager;
     private readonly ILogger<ParticipantTranscribeSession> _logger;
     private readonly bool _broadcastPartials;
-    private string _participantId;
+
+    /// <summary>When set, all transcripts for this AWS stream belong to this MSI.</summary>
+    private readonly uint? _fixedSourceStreamId;
+
     private readonly ConcurrentQueue<byte[]> _audioQueue = new();
     private readonly SemaphoreSlim _audioSignal = new(0);
     private readonly CancellationTokenSource _cts = new();
     private readonly object _stateLock = new();
     private readonly object _runLock = new();
 
-    private string _displayName;
     private Task? _sessionTask;
     private string? _lastPartial;
     /// <summary>Dedupe only identical AWS segment replays (same start/end/text), not repeated words in a new utterance.</summary>
@@ -151,17 +151,20 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
     private Timer? _silenceKeepAliveTimer;
 
+    // Mixed-dominant only: updated before each chunk.
+    private uint? _mixedActiveSourceId;
+    private string _mixedDisplayName = "";
+    private string? _mixedFallbackUserId;
+
     public ParticipantTranscribeSession(
         BotSettings settings,
-        string participantId,
-        string displayName,
+        uint? fixedSourceStreamId,
         TranscriptAggregator transcriptAggregator,
         ParticipantManager participantManager,
         ILogger<ParticipantTranscribeSession> logger)
     {
         _settings = settings;
-        _participantId = participantId;
-        _displayName = displayName;
+        _fixedSourceStreamId = fixedSourceStreamId;
         _transcriptAggregator = transcriptAggregator;
         _participantManager = participantManager;
         _logger = logger;
@@ -169,21 +172,20 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         _lastRealAudioUtc = DateTime.UtcNow;
     }
 
-    public void UpdateDisplayName(string displayName)
+    public void UpdateMixedDominantContext(uint? sourceStreamId, string displayName, string? userIdWhenNoSourceStream)
     {
-        lock (_stateLock)
+        if (_fixedSourceStreamId is not null)
         {
-            _displayName = displayName;
+            throw new InvalidOperationException("UpdateMixedDominantContext applies only to the mixed-audio session.");
         }
-    }
 
-    /// <summary>Used for the dominant-mixed session so transcript lines carry the current Teams speaker (Entra id + name).</summary>
-    public void UpdateTranscriptIdentity(string participantId, string displayName)
-    {
         lock (_stateLock)
         {
-            _participantId = participantId;
-            _displayName = displayName;
+            _mixedActiveSourceId = sourceStreamId;
+            _mixedDisplayName = string.IsNullOrWhiteSpace(displayName) ? "" : displayName.Trim();
+            _mixedFallbackUserId = string.IsNullOrWhiteSpace(userIdWhenNoSourceStream)
+                ? null
+                : userIdWhenNoSourceStream.Trim();
         }
     }
 
@@ -199,8 +201,8 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             if (_sessionTask?.IsFaulted == true)
             {
                 _logger.LogWarning(
-                    "Restarting AWS Transcribe stream for session key {SessionKey} after prior failure.",
-                    _participantId);
+                    "Restarting AWS Transcribe stream for session {SessionKey} after prior failure.",
+                    SessionKeyForLogs);
             }
 
             _sessionTask = RunSessionLoopAsync();
@@ -217,6 +219,9 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
         return Task.CompletedTask;
     }
+
+    private string SessionKeyForLogs =>
+        _fixedSourceStreamId is uint f ? $"src:{f}" : AwsTranscribeService.DominantMixedSessionKey;
 
     public void EnqueueAudio(byte[] pcmAudio, long _)
     {
@@ -276,14 +281,14 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                     _logger.LogInformation(
                         "Transcribe stream attempt {Attempt} for session {SessionKey}.",
                         attempt,
-                        _participantId);
+                        SessionKeyForLogs);
                 }
 
                 using var response = await client.StartStreamTranscriptionAsync(request, _cts.Token);
                 var resultStream = response.TranscriptResultStream;
                 resultStream.ExceptionReceived += (_, ev) =>
                 {
-                    _logger.LogError(ev.EventStreamException, "Transcribe result stream exception for session {SessionKey}.", _participantId);
+                    _logger.LogError(ev.EventStreamException, "Transcribe result stream exception for session {SessionKey}.", SessionKeyForLogs);
                 };
                 resultStream.TranscriptEventReceived += (_, e) =>
                 {
@@ -302,7 +307,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Transcribe stream ended for session {SessionKey}; will retry if call continues.", _participantId);
+                _logger.LogError(ex, "Transcribe stream ended for session {SessionKey}; will retry if call continues.", SessionKeyForLogs);
                 try
                 {
                     var delay = Math.Min(5000, 250 * attempt);
@@ -323,14 +328,6 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             return;
         }
 
-        string displayName;
-        string participantIdForBroadcast;
-        lock (_stateLock)
-        {
-            displayName = _displayName;
-            participantIdForBroadcast = _participantId;
-        }
-
         foreach (var result in te.Transcript.Results)
         {
             if (result.Alternatives?.Count is not > 0)
@@ -342,6 +339,32 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             if (string.IsNullOrWhiteSpace(text))
             {
                 continue;
+            }
+
+            uint? sourceForFragment;
+            string userIdForBroadcast;
+            string displayName;
+            lock (_stateLock)
+            {
+                sourceForFragment = _fixedSourceStreamId ?? _mixedActiveSourceId;
+                if (sourceForFragment is uint sid)
+                {
+                    userIdForBroadcast = ParticipantManager.SyntheticParticipantId(sid);
+                    displayName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ??
+                                  (_participantManager.TryGetBinding(sid, out var b) && b is not null
+                                      ? b.DisplayName
+                                      : _mixedDisplayName);
+                }
+                else if (_fixedSourceStreamId is null && _mixedFallbackUserId is not null)
+                {
+                    userIdForBroadcast = _mixedFallbackUserId;
+                    displayName = _mixedDisplayName;
+                    sourceForFragment = null;
+                }
+                else
+                {
+                    continue;
+                }
             }
 
             if (result.IsPartial == true)
@@ -365,14 +388,15 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 _lastPartial = text;
                 _lastPartialUtc = DateTime.UtcNow;
                 var partialEmitted = DateTime.UtcNow;
-                var partialName = _participantManager.GetCanonicalDisplayName(participantIdForBroadcast) ?? displayName;
+                var partialName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
                 await _transcriptAggregator.PublishAsync(new TranscriptFragment(
                     AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
                     EmittedAtUtc: partialEmitted,
                     Kind: "Partial",
                     Text: text,
-                    UserId: participantIdForBroadcast,
-                    DisplayName: partialName));
+                    UserId: userIdForBroadcast,
+                    DisplayName: partialName,
+                    SourceStreamId: sourceForFragment));
                 continue;
             }
 
@@ -388,15 +412,16 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
             _lastFinalDedupeKey = dedupeKey;
             var finalEmitted = DateTime.UtcNow;
-            var finalName = _participantManager.GetCanonicalDisplayName(participantIdForBroadcast) ?? displayName;
+            var finalName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
             _logger.LogInformation("Transcript mapped to {ParticipantName}: {Text}", finalName, text);
             await _transcriptAggregator.PublishAsync(new TranscriptFragment(
                 AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
                 EmittedAtUtc: finalEmitted,
                 Kind: "Final",
                 Text: text,
-                UserId: participantIdForBroadcast,
-                DisplayName: finalName));
+                UserId: userIdForBroadcast,
+                DisplayName: finalName,
+                SourceStreamId: sourceForFragment));
         }
     }
 

@@ -16,6 +16,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
 {
     private readonly BotSettings _settings;
     private readonly TranscriptAggregator _aggregator;
+    private readonly uint _sourceStreamId;
     private readonly ILogger<TranscribeStreamService> _logger;
     private readonly bool _broadcastPartials;
     private readonly ConcurrentQueue<(byte[] Bytes, long Timestamp)> _audioQueue = new();
@@ -36,11 +37,13 @@ public sealed class TranscribeStreamService : IAsyncDisposable
     public TranscribeStreamService(
         BotSettings settings,
         TranscriptAggregator aggregator,
+        uint sourceStreamId,
         ParticipantIdentity participant,
         ILogger<TranscribeStreamService> logger)
     {
         _settings = settings;
         _aggregator = aggregator;
+        _sourceStreamId = sourceStreamId;
         _participant = participant;
         _logger = logger;
         _broadcastPartials = settings.TranscriptBroadcastPartials;
@@ -225,7 +228,8 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                     Kind: "Partial",
                     Text: text,
                     UserId: participant.UserId,
-                    DisplayName: participant.DisplayName));
+                    DisplayName: participant.DisplayName,
+                    SourceStreamId: _sourceStreamId));
                 continue;
             }
 
@@ -247,7 +251,8 @@ public sealed class TranscribeStreamService : IAsyncDisposable
                 Kind: "Final",
                 Text: text,
                 UserId: participant.UserId,
-                DisplayName: participant.DisplayName));
+                DisplayName: participant.DisplayName,
+                SourceStreamId: _sourceStreamId));
         }
     }
 

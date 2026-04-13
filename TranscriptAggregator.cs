@@ -10,7 +10,8 @@ public sealed record TranscriptFragment(
     string Kind,
     string Text,
     string UserId,
-    string DisplayName);
+    string DisplayName,
+    uint? SourceStreamId = null);
 
 /// <summary>
 /// Merges transcripts from multiple participant streams into a single timeline.
@@ -75,7 +76,10 @@ public sealed class TranscriptAggregator : BackgroundService
                 item = _timeline.Dequeue();
             }
 
-            var (resolvedUserId, resolvedDisplayName) = _identityResolver.Resolve(item.UserId, item.DisplayName);
+            var (resolvedUserId, resolvedDisplayName) = _identityResolver.Resolve(
+                item.UserId,
+                item.DisplayName,
+                item.SourceStreamId);
 
             await _broadcaster.BroadcastAsync(
                 item.Kind,
@@ -83,7 +87,8 @@ public sealed class TranscriptAggregator : BackgroundService
                 item.EmittedAtUtc,
                 item.AudioTimestamp,
                 speakerLabel: resolvedDisplayName,
-                azureAdObjectId: resolvedUserId);
+                azureAdObjectId: resolvedUserId,
+                sourceStreamId: item.SourceStreamId);
         }
     }
 }

@@ -18,8 +18,13 @@ public sealed class TranscriptIdentityResolver
     }
 
     /// <summary>Returns Entra object id and display name suitable for SignalR and ALB payloads.</summary>
-    public (string UserId, string DisplayName) Resolve(string? userId, string? displayName)
+    public (string UserId, string DisplayName) Resolve(string? userId, string? displayName, uint? sourceStreamId = null)
     {
+        if (sourceStreamId is uint sid)
+        {
+            return ResolveFromSourceStreamId(sid, displayName);
+        }
+
         var uid = userId?.Trim() ?? "";
         var dn = displayName?.Trim() ?? "";
 
@@ -38,10 +43,29 @@ public sealed class TranscriptIdentityResolver
             return (uid, _participantManager.GetCanonicalDisplayName(uid) ?? dn);
         }
 
-        if (_participantManager.TryResolveAudioSource(sourceId, out var boundId, out var boundDn) &&
-            !ParticipantManager.IsSyntheticParticipantId(boundId))
+        return ResolveFromSourceStreamId(sourceId, dn);
+    }
+
+    private (string UserId, string DisplayName) ResolveFromSourceStreamId(uint sourceId, string? displayNameFallback)
+    {
+        var dn = displayNameFallback?.Trim() ?? "";
+
+        if (_participantManager.TryGetBinding(sourceId, out var binding) && binding is not null)
         {
-            return (boundId, _participantManager.GetCanonicalDisplayName(boundId) ?? boundDn);
+            var uid = !string.IsNullOrWhiteSpace(binding.EntraOid)
+                ? binding.EntraOid.Trim()
+                : ParticipantManager.SyntheticParticipantId(sourceId);
+
+            var name = string.IsNullOrWhiteSpace(binding.DisplayName)
+                ? dn
+                : binding.DisplayName.Trim();
+
+            if (!string.IsNullOrWhiteSpace(binding.EntraOid))
+            {
+                name = _participantManager.GetCanonicalDisplayName(binding.EntraOid.Trim()) ?? name;
+            }
+
+            return (uid, name);
         }
 
         if (_meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var entraOid, out var rosterName))
@@ -49,7 +73,7 @@ public sealed class TranscriptIdentityResolver
             return (entraOid, rosterName);
         }
 
-        return (uid, _participantManager.GetCanonicalDisplayName(uid) ?? dn);
+        return (ParticipantManager.SyntheticParticipantId(sourceId), _participantManager.GetCanonicalDisplayName(ParticipantManager.SyntheticParticipantId(sourceId)) ?? dn);
     }
 
     private static bool TryParseSyntheticSourceId(string uid, out uint sourceId)
