@@ -11,7 +11,8 @@ public sealed record TranscriptFragment(
     string Text,
     string UserId,
     string DisplayName,
-    uint? SourceStreamId = null);
+    uint? SourceStreamId = null,
+    bool FromBufferedReplay = false);
 
 /// <summary>
 /// Merges transcripts from multiple participant streams into a single timeline.
@@ -22,6 +23,7 @@ public sealed class TranscriptAggregator : BackgroundService
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly TranscriptIdentityResolver _identityResolver;
     private readonly IParticipantManager _participantManager;
+    private readonly SpeakerIdentityStore _speakerIdentityStore;
     private readonly TranscriptBuffer _buffer;
     private readonly TranscriptDeduplicator _deduplicator;
     private readonly ILogger<TranscriptAggregator> _logger;
@@ -34,6 +36,7 @@ public sealed class TranscriptAggregator : BackgroundService
         TranscriptBroadcaster broadcaster,
         TranscriptIdentityResolver identityResolver,
         IParticipantManager participantManager,
+        SpeakerIdentityStore speakerIdentityStore,
         TranscriptBuffer buffer,
         TranscriptDeduplicator deduplicator,
         ILogger<TranscriptAggregator> logger)
@@ -42,6 +45,7 @@ public sealed class TranscriptAggregator : BackgroundService
         _broadcaster = broadcaster;
         _identityResolver = identityResolver;
         _participantManager = participantManager;
+        _speakerIdentityStore = speakerIdentityStore;
         _buffer = buffer;
         _deduplicator = deduplicator;
         _logger = logger;
@@ -104,23 +108,32 @@ public sealed class TranscriptAggregator : BackgroundService
     {
         if (string.Equals(item.Kind, "Final", StringComparison.OrdinalIgnoreCase))
         {
-            if (!_deduplicator.ShouldPass(item.SourceStreamId, item.Text, item.EmittedAtUtc))
+            if (!item.FromBufferedReplay && !_deduplicator.ShouldPass(item.SourceStreamId, item.Text, item.EmittedAtUtc))
             {
                 return;
             }
 
-            if (item.SourceStreamId is uint sid &&
-                (!_participantManager.TryGetBinding(sid, out var binding) || binding is null || binding.State != IdentityState.Resolved))
+            if (!item.FromBufferedReplay &&
+                item.SourceStreamId is uint sidUnres &&
+                (!_participantManager.TryGetBinding(sidUnres, out var bindingUnres) ||
+                 bindingUnres is null ||
+                 bindingUnres.State != IdentityState.Resolved))
             {
                 _buffer.Buffer(item);
-                await _broadcaster.BroadcastAsync(
+                _speakerIdentityStore.RegisterPendingTranscript(
+                    sidUnres,
+                    new SpeakerTranscriptRecord
+                    {
+                        Text = item.Text,
+                        SourceId = sidUnres,
+                        Timestamp = item.EmittedAtUtc
+                    });
+                await _broadcaster.BroadcastTempFinalAsync(
                     item.Kind,
                     item.Text,
                     item.EmittedAtUtc,
                     item.AudioTimestamp,
-                    speakerLabel: $"Unresolved Speaker ({sid})",
-                    azureAdObjectId: ParticipantManager.SyntheticParticipantId(sid),
-                    sourceStreamId: sid);
+                    sidUnres);
                 return;
             }
         }
@@ -131,21 +144,48 @@ public sealed class TranscriptAggregator : BackgroundService
             item.SourceStreamId);
 
         if (string.Equals(item.Kind, "Final", StringComparison.OrdinalIgnoreCase) &&
+            !item.FromBufferedReplay &&
             (resolvedUserId.StartsWith(ParticipantManager.SyntheticIdPrefix, StringComparison.OrdinalIgnoreCase) ||
-             resolvedDisplayName.StartsWith("Unresolved Speaker", StringComparison.OrdinalIgnoreCase)))
+             string.IsNullOrWhiteSpace(resolvedDisplayName)))
         {
             if (item.SourceStreamId is uint sid)
             {
                 _buffer.Buffer(item);
-                await _broadcaster.BroadcastAsync(
+                _speakerIdentityStore.RegisterPendingTranscript(
+                    sid,
+                    new SpeakerTranscriptRecord
+                    {
+                        Text = item.Text,
+                        SourceId = sid,
+                        Timestamp = item.EmittedAtUtc
+                    });
+                await _broadcaster.BroadcastTempFinalAsync(
                     item.Kind,
                     item.Text,
                     item.EmittedAtUtc,
                     item.AudioTimestamp,
-                    speakerLabel: $"Unresolved Speaker ({sid})",
-                    azureAdObjectId: ParticipantManager.SyntheticParticipantId(sid),
-                    sourceStreamId: sid);
+                    sid);
             }
+
+            return;
+        }
+
+        if (item.FromBufferedReplay)
+        {
+            if (string.Equals(item.Kind, "Final", StringComparison.OrdinalIgnoreCase) &&
+                !_deduplicator.ShouldPass(item.SourceStreamId, item.Text, item.EmittedAtUtc))
+            {
+                return;
+            }
+
+            await _broadcaster.RecordAlbFinalChunkAsync(
+                item.Kind,
+                item.Text,
+                item.EmittedAtUtc,
+                item.AudioTimestamp,
+                resolvedUserId,
+                resolvedDisplayName,
+                item.SourceStreamId);
             return;
         }
 
@@ -164,16 +204,16 @@ public sealed class TranscriptAggregator : BackgroundService
         var flushed = _buffer.DrainResolved(_participantManager);
         foreach (var item in flushed.OrderBy(f => f.AudioTimestamp))
         {
-            await HandleFragmentAsync(item);
+            await HandleFragmentAsync(item with { FromBufferedReplay = true });
         }
     }
 
-    public async Task ResolvePending(uint sourceId, string? _displayName = null)
+    public async Task ResolvePendingAsync(uint sourceId, string? _displayName = null)
     {
         var flushed = _buffer.ResolvePending(sourceId, _participantManager);
         foreach (var item in flushed.OrderBy(f => f.AudioTimestamp))
         {
-            await HandleFragmentAsync(item);
+            await HandleFragmentAsync(item with { FromBufferedReplay = true });
         }
     }
 }

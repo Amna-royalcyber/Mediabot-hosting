@@ -59,37 +59,13 @@ public sealed class IdentityBackfillService : BackgroundService
             return;
         }
 
-        // Refresh display names for already-resolved identities.
+        // Refresh display names for already-resolved identities (authoritative roster only).
         foreach (var entry in roster)
         {
             if (_participantManager.TryGetSourceIdForIdentity(entry.Oid, out var resolvedSourceId))
             {
                 _participantManager.TryBindAudioSource(resolvedSourceId, entry.Oid, entry.DisplayName, "GraphBackfillRefresh");
             }
-        }
-
-        var unresolvedSources = _participantManager.GetUnresolvedSourceIds().Distinct().ToList();
-        if (unresolvedSources.Count == 0)
-        {
-            return;
-        }
-
-        var assigned = _participantManager.GetParticipantIdsWithAudioSourceBindings();
-        var unassignedRoster = roster
-            .Where(r => !assigned.Contains(r.Oid))
-            .ToList();
-
-        // Deterministic delayed bind only when one pending stream and one unassigned identity remain.
-        if (unresolvedSources.Count == 1 && unassignedRoster.Count == 1)
-        {
-            var sid = unresolvedSources[0];
-            var target = unassignedRoster[0];
-            _participantManager.TryBindAudioSource(sid, target.Oid, target.DisplayName, "DelayedBackfill");
-            _logger.LogInformation(
-                "Delayed identity backfill applied: sourceId {SourceId} -> {DisplayName} ({EntraOid}).",
-                sid,
-                target.DisplayName,
-                target.Oid);
         }
     }
 }

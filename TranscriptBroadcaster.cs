@@ -22,6 +22,7 @@ public sealed class TranscriptBroadcaster
         _logger = logger;
     }
 
+    /// <summary>Live transcript with resolved speaker (SignalR + optional ALB chunk).</summary>
     public async Task BroadcastAsync(
         string kind,
         string text,
@@ -54,6 +55,8 @@ public sealed class TranscriptBroadcaster
                 speakerLabel,
                 userPrincipalName,
                 azureAdObjectId = entraForClients,
+                sourceId = sourceStreamId,
+                tempLabel = false,
                 timestamp = DateTimeOffset.UtcNow
             });
         }
@@ -70,6 +73,114 @@ public sealed class TranscriptBroadcaster
             return;
         }
 
+        await RecordAlbFinalCoreAsync(
+            utteranceUtc,
+            audioTimestampHns,
+            text,
+            resolvedEntraForClients,
+            azureAdObjectId,
+            speakerLabel,
+            sourceStreamId);
+    }
+
+    /// <summary>Final transcript before Entra/display name is known — no resolved speaker label, no ALB chunk yet.</summary>
+    public async Task BroadcastTempFinalAsync(
+        string kind,
+        string text,
+        DateTime utteranceUtc,
+        long audioTimestampHns,
+        uint sourceId)
+    {
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("transcript", new
+            {
+                kind,
+                text,
+                sourceId,
+                userId = (string?)null,
+                tempLabel = true,
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR temp transcript broadcast failed for kind={Kind}.", kind);
+        }
+    }
+
+    /// <summary>Clients should patch all prior lines for <paramref name="sourceId"/> with the resolved display name.</summary>
+    public async Task BroadcastTranscriptIdentityUpdateAsync(uint sourceId, string? displayName, string? entraOid)
+    {
+        var resolvedEntra = string.IsNullOrWhiteSpace(entraOid)
+            ? null
+            : _participantManager.GetEntraObjectIdForTranscriptPayload(entraOid);
+        var entraForClients = !string.IsNullOrWhiteSpace(resolvedEntra) &&
+                              ParticipantManager.IsSyntheticParticipantId(resolvedEntra)
+            ? null
+            : resolvedEntra;
+
+        try
+        {
+            await _hubContext.Clients.All.SendAsync("transcript-update", new
+            {
+                type = "transcript-update",
+                sourceId,
+                displayName,
+                azureAdObjectId = entraForClients,
+                timestamp = DateTimeOffset.UtcNow
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "SignalR transcript-update failed for sourceId={SourceId}.", sourceId);
+        }
+    }
+
+    /// <summary>ALB chunk only (used when a final was first emitted as temp, then identity resolved).</summary>
+    public async Task RecordAlbFinalChunkAsync(
+        string kind,
+        string text,
+        DateTime utteranceUtc,
+        long audioTimestampHns,
+        string? azureAdObjectId,
+        string? speakerLabel,
+        uint? sourceStreamId)
+    {
+        if (!string.Equals(kind, "Final", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(text) ||
+            string.IsNullOrWhiteSpace(speakerLabel) ||
+            (string.IsNullOrWhiteSpace(azureAdObjectId) && sourceStreamId is null))
+        {
+            return;
+        }
+
+        var resolvedFromResolver = string.IsNullOrWhiteSpace(azureAdObjectId)
+            ? null
+            : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId);
+        var resolvedEntraForClients = !string.IsNullOrWhiteSpace(resolvedFromResolver)
+            ? resolvedFromResolver
+            : (sourceStreamId is uint sid ? _participantManager.GetEntraOidForTranscript(sid) : null);
+
+        await RecordAlbFinalCoreAsync(
+            utteranceUtc,
+            audioTimestampHns,
+            text,
+            resolvedEntraForClients,
+            azureAdObjectId,
+            speakerLabel,
+            sourceStreamId);
+    }
+
+    private async Task RecordAlbFinalCoreAsync(
+        DateTime utteranceUtc,
+        long audioTimestampHns,
+        string text,
+        string? resolvedEntraForClients,
+        string? azureAdObjectId,
+        string speakerLabel,
+        uint? sourceStreamId)
+    {
         var dedupeKey = $"{sourceStreamId?.ToString() ?? azureAdObjectId}|{audioTimestampHns.ToString(System.Globalization.CultureInfo.InvariantCulture)}|{text}";
         try
         {

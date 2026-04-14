@@ -18,7 +18,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
     private readonly ILogger<TranscribeStreamService> _streamLogger;
     private readonly ILogger<TranscriptionManager> _logger;
     private readonly ConcurrentDictionary<uint, TranscribeStreamService> _streamsBySourceId = new();
-    private readonly ConcurrentDictionary<uint, ParticipantIdentity> _participantBySourceId = new();
+    private readonly ConcurrentDictionary<uint, TranscribeParticipantSnapshot> _participantBySourceId = new();
     private readonly ConcurrentDictionary<string, List<uint>> _sourceIdsByUserId = new(StringComparer.OrdinalIgnoreCase);
     private ICall? _attachedCall;
     private string? _botClientId;
@@ -79,7 +79,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
                 label = "Unknown";
             }
 
-            var syn = new ParticipantIdentity(syntheticId, label);
+            var syn = new TranscribeParticipantSnapshot(syntheticId, label);
             if (_participantBySourceId.TryAdd(sourceId, syn))
             {
                 participant = syn;
@@ -133,7 +133,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
             displayName = userId;
         }
 
-        var identityRecord = new ParticipantIdentity(userId.Trim(), displayName.Trim());
+        var identityRecord = new TranscribeParticipantSnapshot(userId.Trim(), displayName.Trim());
         var sourceIds = TryExtractSourceIds(resource);
         if (sourceIds.Count == 0)
         {

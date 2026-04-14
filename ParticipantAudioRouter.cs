@@ -28,12 +28,9 @@ public sealed class ParticipantAudioRouter
 
     private int _loggedMixedMode;
     private int _loggedDominantNotYetMixed;
-    private int _loggedMultiParticipantInferenceSkipped;
     private int _loggedUnknownMixedFallback;
 
     private readonly object _inferLock = new();
-
-    private readonly ConcurrentDictionary<uint, byte> _warnedUnmappedSourceIds = new();
 
     /// <summary>Last time we saw PCM for this MSI (unmixed chunk or dominant-speaker event). Used for mixed-mode “recent speakers” only.</summary>
     private readonly ConcurrentDictionary<uint, DateTime> _lastSeenAudio = new();
@@ -128,12 +125,9 @@ public sealed class ParticipantAudioRouter
             {
                 if (!TryApplyRosterMediaStreamMap(sourceId, out participantId, out displayName))
                 {
-                    var roster = _meetingParticipants.GetRosterSnapshot();
-                    if (!TryInferBindingForUnmappedSource(sourceId, roster, out participantId, out displayName))
-                    {
-                        LogUnmappedSourceIdOnce(sourceId);
-                        continue;
-                    }
+                    EnsureSyntheticBinding(sourceId);
+                    participantId = ParticipantManager.SyntheticParticipantId(sourceId);
+                    displayName = string.Empty;
                 }
             }
 
@@ -164,9 +158,7 @@ public sealed class ParticipantAudioRouter
     }
 
     /// <summary>
-    /// Mixed meeting audio (single buffer) — attribute text to the participant mapped from Teams <strong>dominant speaker</strong>
-    /// source id (MSI), using Graph <c>mediaStreams[].sourceId</c> → Entra user. If the dominant id is not mapped yet,
-    /// we fall back to the first roster entry (degraded) so you still get transcripts.
+    /// Mixed meeting audio (single buffer) — attribute text only via <c>sourceId</c> → <see cref="ParticipantManager"/> (no roster name guessing).
     /// </summary>
     private async Task TrySendMainBufferMixedDominantAsync(AudioMediaReceivedEventArgs args)
     {
@@ -202,11 +194,11 @@ public sealed class ParticipantAudioRouter
                 out var mixedUserIdWhenNoStream))
         {
             mixedSourceId = null;
-            mixedDisplayName = "Speaker";
+            mixedDisplayName = string.Empty;
             mixedUserIdWhenNoStream = null;
             if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
             {
-                _logger.LogWarning("No authoritative attribution available — sending mixed audio with UNKNOWN speaker.");
+                _logger.LogWarning("No authoritative mixed attribution — sending audio without speaker identity (unknown source).");
             }
         }
 
@@ -291,43 +283,14 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    /// <summary>
-    /// When Graph has not yet correlated <c>mediaStreams[].sourceId</c> to a user, create a per-MSI placeholder only.
-    /// Entra identity is applied later via authoritative Graph/roster mediaStreams mapping only.
-    /// </summary>
-    private bool TryInferBindingForUnmappedSource(
-        uint sourceId,
-        IReadOnlyList<RosterParticipantDto> roster,
-        out string participantId,
-        out string displayName)
+    private void EnsureSyntheticBinding(uint sourceId)
     {
-        participantId = string.Empty;
-        displayName = string.Empty;
         lock (_inferLock)
         {
-            if (_participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName))
+            if (!_participantManager.HasBinding(sourceId))
             {
-                return true;
+                _participantManager.TryBindAudioSource(sourceId, null, string.Empty, "SyntheticUntilGraph");
             }
-
-            if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
-            {
-                _logger.LogInformation(
-                    "Graph has not mapped mediaStreams for some streams yet; using per-MSI placeholders until authoritative sourceId → user mapping arrives.");
-            }
-
-            _participantManager.TryBindAudioSource(sourceId, null, string.Empty, "SyntheticUntilGraph");
-            return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
-        }
-    }
-
-    private void LogUnmappedSourceIdOnce(uint sourceId)
-    {
-        if (_warnedUnmappedSourceIds.TryAdd(sourceId, 0))
-        {
-            _logger.LogWarning(
-                "Could not infer Entra user for sourceId {SourceId}. Check roster vs participants, or Graph mediaStreams payload.",
-                sourceId);
         }
     }
 

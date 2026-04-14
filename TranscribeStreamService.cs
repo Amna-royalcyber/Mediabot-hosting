@@ -7,7 +7,7 @@ using Microsoft.Extensions.Logging;
 
 namespace TeamsMediaBot;
 
-public sealed record ParticipantIdentity(string UserId, string DisplayName);
+public sealed record TranscribeParticipantSnapshot(string UserId, string DisplayName);
 
 /// <summary>
 /// One AWS Transcribe streaming session per participant/source.
@@ -25,7 +25,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
     private readonly object _participantLock = new();
     private readonly object _runLock = new();
 
-    private ParticipantIdentity _participant;
+    private TranscribeParticipantSnapshot _participant;
     private Task? _sessionTask;
     private string? _lastFinalDedupeKey;
     private string? _lastPartialTranscript;
@@ -38,7 +38,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         BotSettings settings,
         TranscriptAggregator aggregator,
         uint sourceStreamId,
-        ParticipantIdentity participant,
+        TranscribeParticipantSnapshot participant,
         ILogger<TranscribeStreamService> logger)
     {
         _settings = settings;
@@ -50,7 +50,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
         _lastRealAudioUtc = DateTime.UtcNow;
     }
 
-    public void UpdateParticipant(ParticipantIdentity participant)
+    public void UpdateParticipant(TranscribeParticipantSnapshot participant)
     {
         lock (_participantLock)
         {
@@ -182,7 +182,7 @@ public sealed class TranscribeStreamService : IAsyncDisposable
             return;
         }
 
-        ParticipantIdentity participant;
+        TranscribeParticipantSnapshot participant;
         lock (_participantLock)
         {
             participant = _participant;

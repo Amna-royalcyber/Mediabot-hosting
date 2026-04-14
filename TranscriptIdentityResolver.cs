@@ -55,7 +55,7 @@ public sealed class TranscriptIdentityResolver
             var canonicalName = _participantManager.GetCanonicalDisplayName(mappedUserId);
             var resolvedName = !string.IsNullOrWhiteSpace(canonicalName)
                 ? canonicalName
-                : (string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn);
+                : (string.IsNullOrWhiteSpace(dn) ? string.Empty : dn);
             return (mappedUserId, resolvedName);
         }
 
@@ -70,7 +70,7 @@ public sealed class TranscriptIdentityResolver
                 _participantManager.TryGetBinding(sourceId, out binding);
                 if (binding is null)
                 {
-                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn);
+                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? string.Empty : dn);
                 }
             }
 
@@ -81,7 +81,7 @@ public sealed class TranscriptIdentityResolver
             var name = _participantManager.GetTranscriptSpeakerLabel(sourceId);
             if (string.IsNullOrWhiteSpace(name))
             {
-                name = string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn;
+                name = string.IsNullOrWhiteSpace(dn) ? string.Empty : dn;
             }
 
             return (uid, name);
@@ -96,7 +96,7 @@ public sealed class TranscriptIdentityResolver
         var fallbackName = _participantManager.GetCanonicalDisplayName(ParticipantManager.SyntheticParticipantId(sourceId));
         if (string.IsNullOrWhiteSpace(fallbackName))
         {
-            fallbackName = string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn;
+            fallbackName = string.IsNullOrWhiteSpace(dn) ? string.Empty : dn;
         }
         return (ParticipantManager.SyntheticParticipantId(sourceId), fallbackName);
     }

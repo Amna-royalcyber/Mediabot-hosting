@@ -79,6 +79,7 @@ public static class Program
         builder.Services.AddSingleton<TranscriptBuffer>();
         builder.Services.AddSingleton<TranscriptDeduplicator>();
         builder.Services.AddSingleton<TranscriptBroadcaster>();
+        builder.Services.AddSingleton<SpeakerIdentityStore>();
         builder.Services.AddSingleton<TranscriptAggregator>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());
         builder.Services.AddSingleton<EntraUserResolver>();

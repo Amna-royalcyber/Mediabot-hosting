@@ -2,6 +2,7 @@ namespace TeamsMediaBot;
 
 public interface IParticipantManager
 {
+    bool HasBinding(uint sourceId);
     bool TryGetBinding(uint sourceId, out ParticipantBinding? binding);
     bool TryResolveUserFromAudioStream(uint sourceId, out string userId);
     string GetTranscriptSpeakerLabel(uint sourceId);
