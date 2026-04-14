@@ -107,13 +107,6 @@ public sealed class ParticipantManager
             return true;
         }
 
-        // Safe fallback only when exactly one roster user exists in this session.
-        if (_sessionUserToSpeakerMap.Count == 1)
-        {
-            userId = _sessionUserToSpeakerMap.Keys.First();
-            return true;
-        }
-
         return false;
     }
 

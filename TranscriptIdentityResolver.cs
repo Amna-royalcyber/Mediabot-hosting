@@ -50,6 +50,16 @@ public sealed class TranscriptIdentityResolver
     {
         var dn = displayNameFallback?.Trim() ?? "";
 
+        if (_participantManager.TryResolveUserFromAudioStream(sourceId, out var mappedUserId))
+        {
+            var speakerId = _participantManager.TryGetSpeakerIdForUser(mappedUserId);
+            var canonicalName = _participantManager.GetCanonicalDisplayName(mappedUserId);
+            var resolvedName = !string.IsNullOrWhiteSpace(canonicalName)
+                ? canonicalName
+                : (!string.IsNullOrWhiteSpace(speakerId) ? speakerId : (string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn));
+            return (mappedUserId, resolvedName);
+        }
+
         if (_participantManager.TryGetBinding(sourceId, out var binding) && binding is not null)
         {
             // Late Graph/mediaStreams backfill: if we already have a placeholder binding, upgrade it
@@ -61,7 +71,7 @@ public sealed class TranscriptIdentityResolver
                 _participantManager.TryGetBinding(sourceId, out binding);
                 if (binding is null)
                 {
-                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? "Speaker" : dn);
+                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn);
                 }
             }
 
@@ -72,7 +82,7 @@ public sealed class TranscriptIdentityResolver
             var name = _participantManager.GetTranscriptSpeakerLabel(sourceId);
             if (string.IsNullOrWhiteSpace(name))
             {
-                name = dn;
+                name = string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn;
             }
 
             return (uid, name);
@@ -80,10 +90,20 @@ public sealed class TranscriptIdentityResolver
 
         if (_meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var entraOid, out var rosterName))
         {
+            var speakerId = _participantManager.TryGetSpeakerIdForUser(entraOid);
+            if (string.IsNullOrWhiteSpace(rosterName) && !string.IsNullOrWhiteSpace(speakerId))
+            {
+                rosterName = speakerId;
+            }
             return (entraOid, rosterName);
         }
 
-        return (ParticipantManager.SyntheticParticipantId(sourceId), _participantManager.GetCanonicalDisplayName(ParticipantManager.SyntheticParticipantId(sourceId)) ?? dn);
+        var fallbackName = _participantManager.GetCanonicalDisplayName(ParticipantManager.SyntheticParticipantId(sourceId));
+        if (string.IsNullOrWhiteSpace(fallbackName))
+        {
+            fallbackName = string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn;
+        }
+        return (ParticipantManager.SyntheticParticipantId(sourceId), fallbackName);
     }
 
     private static bool TryParseSyntheticSourceId(string uid, out uint sourceId)

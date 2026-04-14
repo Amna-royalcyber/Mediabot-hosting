@@ -201,30 +201,12 @@ public sealed class ParticipantAudioRouter
                 out var mixedDisplayName,
                 out var mixedUserIdWhenNoStream))
         {
-            if (roster.Count == 1 && !string.IsNullOrWhiteSpace(roster[0].AzureAdObjectId))
+            mixedSourceId = null;
+            mixedDisplayName = "Speaker";
+            mixedUserIdWhenNoStream = null;
+            if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
             {
-                mixedSourceId = null;
-                mixedUserIdWhenNoStream = roster[0].AzureAdObjectId.Trim();
-                mixedDisplayName = string.IsNullOrWhiteSpace(roster[0].DisplayName)
-                    ? mixedUserIdWhenNoStream
-                    : roster[0].DisplayName.Trim();
-                if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
-                {
-                    _logger.LogInformation(
-                        "Mixed audio has no source attribution yet; using single-roster Entra fallback {DisplayName} ({EntraOid}).",
-                        mixedDisplayName,
-                        mixedUserIdWhenNoStream);
-                }
-            }
-            else
-            {
-                mixedSourceId = null;
-                mixedDisplayName = "Speaker";
-                mixedUserIdWhenNoStream = null;
-                if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
-                {
-                    _logger.LogWarning("No attribution available — sending mixed audio with UNKNOWN speaker.");
-                }
+                _logger.LogWarning("No authoritative attribution available — sending mixed audio with UNKNOWN speaker.");
             }
         }
 
@@ -311,7 +293,7 @@ public sealed class ParticipantAudioRouter
 
     /// <summary>
     /// When Graph has not yet correlated <c>mediaStreams[].sourceId</c> to a user, create a per-MSI placeholder only.
-    /// Entra identity is applied later via Graph/roster — never via roster join order.
+    /// Entra identity is applied later via authoritative Graph/roster mediaStreams mapping only.
     /// </summary>
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
@@ -328,33 +310,10 @@ public sealed class ParticipantAudioRouter
                 return true;
             }
 
-            // Safe fast-bind: if there is exactly one unique Entra user in roster, bind this MSI directly.
-            if (TryGetSingleUniqueRosterIdentity(roster, out var oid, out var dn))
-            {
-                _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
-                _awsTranscribeService.UpsertParticipant(oid, dn);
-                _logger.LogInformation("Single-roster fast bind sourceId {SourceId} -> {DisplayName} ({EntraOid}).", sourceId, dn, oid);
-                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
-            }
-
-            // Deterministic elimination rule:
-            // if exactly one roster user is still not mapped to any sourceId, bind this new source to that user.
-            if (TryGetOnlyUnassignedRosterIdentity(roster, out var remainingOid, out var remainingDn))
-            {
-                _participantManager.TryBindAudioSource(sourceId, remainingOid, remainingDn, "RosterMediaStreamsMap");
-                _awsTranscribeService.UpsertParticipant(remainingOid, remainingDn);
-                _logger.LogInformation(
-                    "Elimination bind sourceId {SourceId} -> {DisplayName} ({EntraOid}) from remaining unmapped roster user.",
-                    sourceId,
-                    remainingDn,
-                    remainingOid);
-                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
-            }
-
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
                 _logger.LogInformation(
-                    "Graph has not mapped mediaStreams for some streams yet; using per-MSI placeholders until Graph provides sourceId → user (no roster-order guessing).");
+                    "Graph has not mapped mediaStreams for some streams yet; using per-MSI placeholders until authoritative sourceId → user mapping arrives.");
             }
 
             _participantManager.TryBindAudioSource(sourceId, null, string.Empty, "SyntheticUntilGraph");
@@ -419,90 +378,6 @@ public sealed class ParticipantAudioRouter
         }
 
         return false;
-    }
-
-    private static bool TryGetSingleUniqueRosterIdentity(
-        IReadOnlyList<RosterParticipantDto> roster,
-        out string entraOid,
-        out string displayName)
-    {
-        entraOid = string.Empty;
-        displayName = string.Empty;
-        if (roster.Count == 0)
-        {
-            return false;
-        }
-
-        var unique = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in roster)
-        {
-            if (string.IsNullOrWhiteSpace(p.AzureAdObjectId))
-            {
-                continue;
-            }
-
-            var oid = p.AzureAdObjectId.Trim();
-            if (unique.ContainsKey(oid))
-            {
-                continue;
-            }
-
-            unique[oid] = string.IsNullOrWhiteSpace(p.DisplayName) ? oid : p.DisplayName.Trim();
-        }
-
-        if (unique.Count != 1)
-        {
-            return false;
-        }
-
-        var only = unique.First();
-        entraOid = only.Key;
-        displayName = only.Value;
-        return true;
-    }
-
-    private bool TryGetOnlyUnassignedRosterIdentity(
-        IReadOnlyList<RosterParticipantDto> roster,
-        out string entraOid,
-        out string displayName)
-    {
-        entraOid = string.Empty;
-        displayName = string.Empty;
-        if (roster.Count == 0)
-        {
-            return false;
-        }
-
-        var alreadyAssigned = _participantManager.GetParticipantIdsWithAudioSourceBindings();
-        var remaining = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in roster)
-        {
-            if (string.IsNullOrWhiteSpace(p.AzureAdObjectId))
-            {
-                continue;
-            }
-
-            var oid = p.AzureAdObjectId.Trim();
-            if (alreadyAssigned.Contains(oid))
-            {
-                continue;
-            }
-
-            if (!remaining.ContainsKey(oid))
-            {
-                remaining[oid] = string.IsNullOrWhiteSpace(p.DisplayName) ? oid : p.DisplayName.Trim();
-            }
-        }
-
-        if (remaining.Count != 1)
-        {
-            return false;
-        }
-
-        var only = remaining.First();
-        entraOid = only.Key;
-        displayName = only.Value;
-        return true;
     }
 
     private List<uint> GetActiveSourceIds()
