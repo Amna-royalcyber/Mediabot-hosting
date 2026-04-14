@@ -8,12 +8,12 @@ namespace TeamsMediaBot;
 /// </summary>
 public sealed class IdentityBackfillService : BackgroundService
 {
-    private readonly ParticipantManager _participantManager;
+    private readonly IParticipantManager _participantManager;
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ILogger<IdentityBackfillService> _logger;
 
     public IdentityBackfillService(
-        ParticipantManager participantManager,
+        IParticipantManager participantManager,
         MeetingParticipantService meetingParticipants,
         ILogger<IdentityBackfillService> logger)
     {

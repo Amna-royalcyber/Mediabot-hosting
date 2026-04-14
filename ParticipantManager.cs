@@ -51,7 +51,7 @@ public enum IdentityState
 /// <summary>
 /// Global registry: <b>sourceId is the single source of truth</b>. Bind once; only enrich metadata; never reassign a stream to another user.
 /// </summary>
-public sealed class ParticipantManager
+public sealed class ParticipantManager : IParticipantManager
 {
     public const string SyntheticIdPrefix = "msi-pending-";
 
@@ -259,7 +259,9 @@ public sealed class ParticipantManager
         var inputDisplayName = string.IsNullOrWhiteSpace(displayName) ? string.Empty : displayName.Trim();
         var graphOrAuthoritative =
             string.Equals(reason, "Graph", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(reason, "RosterMediaStreamsMap", StringComparison.OrdinalIgnoreCase);
+            string.Equals(reason, "RosterMediaStreamsMap", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(reason, "DelayedBackfill", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(reason, "GraphBackfillRefresh", StringComparison.OrdinalIgnoreCase);
 
         if (_bindings.TryGetValue(sourceId, out var existing))
         {

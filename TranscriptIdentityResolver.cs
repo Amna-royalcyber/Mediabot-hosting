@@ -6,11 +6,11 @@ namespace TeamsMediaBot;
 /// </summary>
 public sealed class TranscriptIdentityResolver
 {
-    private readonly ParticipantManager _participantManager;
+    private readonly IParticipantManager _participantManager;
     private readonly MeetingParticipantService _meetingParticipants;
 
     public TranscriptIdentityResolver(
-        ParticipantManager participantManager,
+        IParticipantManager participantManager,
         MeetingParticipantService meetingParticipants)
     {
         _participantManager = participantManager;

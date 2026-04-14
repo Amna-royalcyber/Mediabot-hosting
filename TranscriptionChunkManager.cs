@@ -36,7 +36,7 @@ public sealed class TimeWindowChunk
 /// <summary>
 /// Strict wall-clock 3-minute windows from call anchor. No cross-chunk duplication; each final transcript item once per dedupe key.
 /// </summary>
-public sealed class TranscriptionChunkManager : BackgroundService
+public sealed class TranscriptionChunkManager : BackgroundService, IChunkManager
 {
     private static readonly TimeSpan ChunkDuration = TimeSpan.FromMinutes(3);
 
@@ -46,7 +46,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
 
     private readonly BotSettings _settings;
     private readonly MeetingContextStore _meetingContext;
-    private readonly ParticipantManager _participantManager;
+    private readonly IParticipantManager _participantManager;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<TranscriptionChunkManager> _logger;
 
@@ -60,7 +60,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
     public TranscriptionChunkManager(
         BotSettings settings,
         MeetingContextStore meetingContext,
-        ParticipantManager participantManager,
+        IParticipantManager participantManager,
         IHttpClientFactory httpClientFactory,
         ILogger<TranscriptionChunkManager> logger)
     {
@@ -244,7 +244,7 @@ public sealed class TranscriptionChunkManager : BackgroundService
         }
 
         var ordered = window.Fragments.OrderBy(i => i.Timestamp).ToList();
-        var transcriptList = new List<Dictionary<string, string>>();
+        var transcriptList = new List<AlbTranscriptLine>();
         foreach (var fragment in ordered)
         {
             if (string.IsNullOrWhiteSpace(fragment.Text))
@@ -262,9 +262,11 @@ public sealed class TranscriptionChunkManager : BackgroundService
                 }
             }
 
-            transcriptList.Add(new Dictionary<string, string>(StringComparer.Ordinal)
+            transcriptList.Add(new AlbTranscriptLine
             {
-                [resolvedName] = fragment.Text.Trim()
+                Speaker = resolvedName,
+                Text = fragment.Text.Trim(),
+                Timestamp = fragment.Timestamp
             });
         }
 
@@ -331,9 +333,21 @@ public sealed class TranscriptionChunkManager : BackgroundService
         public string MeetingId { get; set; } = string.Empty;
 
         [JsonPropertyName("transcript")]
-        public List<Dictionary<string, string>> Transcript { get; set; } = new();
+        public List<AlbTranscriptLine> Transcript { get; set; } = new();
 
         [JsonPropertyName("flag")]
         public string Flag { get; set; } = string.Empty;
+    }
+
+    private sealed class AlbTranscriptLine
+    {
+        [JsonPropertyName("speaker")]
+        public string Speaker { get; set; } = string.Empty;
+
+        [JsonPropertyName("text")]
+        public string Text { get; set; } = string.Empty;
+
+        [JsonPropertyName("timestamp")]
+        public DateTime Timestamp { get; set; }
     }
 }

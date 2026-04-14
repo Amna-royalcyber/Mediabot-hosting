@@ -20,9 +20,10 @@ public sealed class MeetingParticipantService
 
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly EntraUserResolver _entra;
-    private readonly ParticipantManager _participantManager;
+    private readonly IParticipantManager _participantManager;
     private readonly ILogger<MeetingParticipantService> _logger;
     private readonly object _lock = new();
+    private readonly ConcurrentDictionary<string, DateTime> _noSourceLogThrottle = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Call participant resource ids (for removals).</summary>
     private readonly Dictionary<string, string> _callParticipantIdToAzureUserId = new(StringComparer.OrdinalIgnoreCase);
@@ -36,7 +37,7 @@ public sealed class MeetingParticipantService
     public MeetingParticipantService(
         TranscriptBroadcaster broadcaster,
         EntraUserResolver entra,
-        ParticipantManager participantManager,
+        IParticipantManager participantManager,
         ILogger<MeetingParticipantService> logger)
     {
         _broadcaster = broadcaster;
@@ -261,6 +262,18 @@ public sealed class MeetingParticipantService
 
         if (sourceIds.Count == 0)
         {
+            var throttleKey = $"{azureUserId}:no-source";
+            if (_noSourceLogThrottle.TryGetValue(throttleKey, out var last) && (DateTime.UtcNow - last) < TimeSpan.FromSeconds(30))
+            {
+                _ = PublishRosterAsync();
+                if (needsGraph)
+                {
+                    _ = EnrichFromGraphAsync(azureUserId);
+                }
+                return;
+            }
+            _noSourceLogThrottle[throttleKey] = DateTime.UtcNow;
+
             var keys = resource.AdditionalData is null
                 ? "<none>"
                 : string.Join(", ", resource.AdditionalData.Keys);

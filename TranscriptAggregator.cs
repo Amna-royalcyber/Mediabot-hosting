@@ -21,6 +21,9 @@ public sealed class TranscriptAggregator : BackgroundService
     private readonly BotSettings _settings;
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly TranscriptIdentityResolver _identityResolver;
+    private readonly IParticipantManager _participantManager;
+    private readonly TranscriptBuffer _buffer;
+    private readonly TranscriptDeduplicator _deduplicator;
     private readonly ILogger<TranscriptAggregator> _logger;
     private readonly Channel<TranscriptFragment> _incoming = Channel.CreateUnbounded<TranscriptFragment>();
     private readonly PriorityQueue<TranscriptFragment, long> _timeline = new();
@@ -30,11 +33,17 @@ public sealed class TranscriptAggregator : BackgroundService
         BotSettings settings,
         TranscriptBroadcaster broadcaster,
         TranscriptIdentityResolver identityResolver,
+        IParticipantManager participantManager,
+        TranscriptBuffer buffer,
+        TranscriptDeduplicator deduplicator,
         ILogger<TranscriptAggregator> logger)
     {
         _settings = settings;
         _broadcaster = broadcaster;
         _identityResolver = identityResolver;
+        _participantManager = participantManager;
+        _buffer = buffer;
+        _deduplicator = deduplicator;
         _logger = logger;
     }
 
@@ -52,6 +61,7 @@ public sealed class TranscriptAggregator : BackgroundService
             }
 
             await DrainAsync(stoppingToken);
+            await FlushResolvedBufferedAsync();
         }
     }
 
@@ -76,19 +86,59 @@ public sealed class TranscriptAggregator : BackgroundService
                 item = _timeline.Dequeue();
             }
 
-            var (resolvedUserId, resolvedDisplayName) = _identityResolver.Resolve(
-                item.UserId,
-                item.DisplayName,
-                item.SourceStreamId);
+            await HandleFragmentAsync(item);
+        }
+    }
 
-            await _broadcaster.BroadcastAsync(
-                item.Kind,
-                item.Text,
-                item.EmittedAtUtc,
-                item.AudioTimestamp,
-                speakerLabel: resolvedDisplayName,
-                azureAdObjectId: resolvedUserId,
-                sourceStreamId: item.SourceStreamId);
+    private async Task HandleFragmentAsync(TranscriptFragment item)
+    {
+        if (string.Equals(item.Kind, "Final", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!_deduplicator.ShouldPass(item.SourceStreamId, item.Text, item.EmittedAtUtc))
+            {
+                return;
+            }
+
+            if (item.SourceStreamId is uint sid &&
+                (!_participantManager.TryGetBinding(sid, out var binding) || binding is null || binding.State != IdentityState.Resolved))
+            {
+                _buffer.Buffer(item);
+                return;
+            }
+        }
+
+        var (resolvedUserId, resolvedDisplayName) = _identityResolver.Resolve(
+            item.UserId,
+            item.DisplayName,
+            item.SourceStreamId);
+
+        if (string.Equals(item.Kind, "Final", StringComparison.OrdinalIgnoreCase) &&
+            (resolvedUserId.StartsWith(ParticipantManager.SyntheticIdPrefix, StringComparison.OrdinalIgnoreCase) ||
+             resolvedDisplayName.StartsWith("Unresolved Speaker", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (item.SourceStreamId is not null)
+            {
+                _buffer.Buffer(item);
+            }
+            return;
+        }
+
+        await _broadcaster.BroadcastAsync(
+            item.Kind,
+            item.Text,
+            item.EmittedAtUtc,
+            item.AudioTimestamp,
+            speakerLabel: resolvedDisplayName,
+            azureAdObjectId: resolvedUserId,
+            sourceStreamId: item.SourceStreamId);
+    }
+
+    private async Task FlushResolvedBufferedAsync()
+    {
+        var flushed = _buffer.DrainResolved(_participantManager);
+        foreach (var item in flushed.OrderBy(f => f.AudioTimestamp))
+        {
+            await HandleFragmentAsync(item);
         }
     }
 }

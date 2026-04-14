@@ -72,8 +72,12 @@ public static class Program
         });
         builder.Services.AddSingleton<MeetingContextStore>();
         builder.Services.AddSingleton<ParticipantManager>();
+        builder.Services.AddSingleton<IParticipantManager>(sp => sp.GetRequiredService<ParticipantManager>());
         builder.Services.AddSingleton<TranscriptionChunkManager>();
+        builder.Services.AddSingleton<IChunkManager>(sp => sp.GetRequiredService<TranscriptionChunkManager>());
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptionChunkManager>());
+        builder.Services.AddSingleton<TranscriptBuffer>();
+        builder.Services.AddSingleton<TranscriptDeduplicator>();
         builder.Services.AddSingleton<TranscriptBroadcaster>();
         builder.Services.AddSingleton<TranscriptAggregator>();
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());
