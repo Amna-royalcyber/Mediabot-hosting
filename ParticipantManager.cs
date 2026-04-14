@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 
@@ -103,6 +104,13 @@ public sealed class ParticipantManager
         if (_bindings.TryGetValue(sourceId, out var b) && !string.IsNullOrWhiteSpace(b.EntraOid))
         {
             userId = b.EntraOid.Trim();
+            return true;
+        }
+
+        // Safe fallback only when exactly one roster user exists in this session.
+        if (_sessionUserToSpeakerMap.Count == 1)
+        {
+            userId = _sessionUserToSpeakerMap.Keys.First();
             return true;
         }
 
@@ -289,7 +297,7 @@ public sealed class ParticipantManager
 
         // First bind only — hard block reassignment is implicit (key did not exist).
         var streamPid = SyntheticParticipantId(sourceId);
-        var stableLabel = $"Speaker {Interlocked.Increment(ref _speakerCounter)}";
+        var stableLabel = "Unknown Speaker";
         var binding = new ParticipantBinding
         {
             SourceId = sourceId,
@@ -315,7 +323,6 @@ public sealed class ParticipantManager
             binding.DisplayName = stableLabel;
         }
 
-        RegisterParticipant(streamPid, binding.DisplayName, DateTime.UtcNow);
         _bindings[sourceId] = binding;
 
         _logger.LogInformation(

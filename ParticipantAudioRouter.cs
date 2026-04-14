@@ -337,6 +337,20 @@ public sealed class ParticipantAudioRouter
                 return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
             }
 
+            // Deterministic elimination rule:
+            // if exactly one roster user is still not mapped to any sourceId, bind this new source to that user.
+            if (TryGetOnlyUnassignedRosterIdentity(roster, out var remainingOid, out var remainingDn))
+            {
+                _participantManager.TryBindAudioSource(sourceId, remainingOid, remainingDn, "RosterMediaStreamsMap");
+                _awsTranscribeService.UpsertParticipant(remainingOid, remainingDn);
+                _logger.LogInformation(
+                    "Elimination bind sourceId {SourceId} -> {DisplayName} ({EntraOid}) from remaining unmapped roster user.",
+                    sourceId,
+                    remainingDn,
+                    remainingOid);
+                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
+            }
+
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
                 _logger.LogInformation(
@@ -442,6 +456,50 @@ public sealed class ParticipantAudioRouter
         }
 
         var only = unique.First();
+        entraOid = only.Key;
+        displayName = only.Value;
+        return true;
+    }
+
+    private bool TryGetOnlyUnassignedRosterIdentity(
+        IReadOnlyList<RosterParticipantDto> roster,
+        out string entraOid,
+        out string displayName)
+    {
+        entraOid = string.Empty;
+        displayName = string.Empty;
+        if (roster.Count == 0)
+        {
+            return false;
+        }
+
+        var alreadyAssigned = _participantManager.GetParticipantIdsWithAudioSourceBindings();
+        var remaining = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in roster)
+        {
+            if (string.IsNullOrWhiteSpace(p.AzureAdObjectId))
+            {
+                continue;
+            }
+
+            var oid = p.AzureAdObjectId.Trim();
+            if (alreadyAssigned.Contains(oid))
+            {
+                continue;
+            }
+
+            if (!remaining.ContainsKey(oid))
+            {
+                remaining[oid] = string.IsNullOrWhiteSpace(p.DisplayName) ? oid : p.DisplayName.Trim();
+            }
+        }
+
+        if (remaining.Count != 1)
+        {
+            return false;
+        }
+
+        var only = remaining.First();
         entraOid = only.Key;
         displayName = only.Value;
         return true;
