@@ -80,6 +80,7 @@ public static class Program
         builder.Services.AddSingleton<EntraUserResolver>();
         builder.Services.AddSingleton<MeetingParticipantService>();
         builder.Services.AddSingleton<TranscriptIdentityResolver>();
+        builder.Services.AddHostedService<IdentityBackfillService>();
         builder.Services.AddSingleton<TranscriptionManager>();
         builder.Services.AddSingleton<ParticipantAudioStreamHandler>();
         builder.Services.AddSingleton<ParticipantAudioRouter>();

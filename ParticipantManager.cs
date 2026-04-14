@@ -103,6 +103,23 @@ public sealed class ParticipantManager
     public bool TryGetBinding(uint sourceId, out ParticipantBinding? binding) =>
         _bindings.TryGetValue(sourceId, out binding);
 
+    public IReadOnlyList<uint> GetUnresolvedSourceIds() =>
+        _bindings
+            .Where(kvp => kvp.Value.State != IdentityState.Resolved)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+    public bool TryGetSourceIdForIdentity(string entraOid, out uint sourceId)
+    {
+        sourceId = 0;
+        if (string.IsNullOrWhiteSpace(entraOid))
+        {
+            return false;
+        }
+
+        return _identityToSourceId.TryGetValue(entraOid.Trim(), out sourceId);
+    }
+
     public bool TryResolveUserFromAudioStream(uint sourceId, out string userId)
     {
         userId = string.Empty;
