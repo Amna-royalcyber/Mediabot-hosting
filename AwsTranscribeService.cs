@@ -417,6 +417,21 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
             _lastFinalDedupeKey = dedupeKey;
             var finalEmitted = DateTime.UtcNow;
             var finalName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
+            string? mappedUserId = null;
+            string? mappedSpeakerId = null;
+            if (sourceForFragment is uint fsid && _participantManager.TryResolveUserFromAudioStream(fsid, out var resolvedUserId))
+            {
+                mappedUserId = resolvedUserId;
+                mappedSpeakerId = _participantManager.TryGetSpeakerIdForUser(resolvedUserId);
+            }
+
+            _logger.LogInformation(
+                "Transcript identity map: sourceId={SourceId}, mappedUserId={MappedUserId}, mappedSpeakerId={MappedSpeakerId}, emittedUserId={EmittedUserId}, displayName={DisplayName}",
+                sourceForFragment?.ToString() ?? "<none>",
+                mappedUserId ?? "<none>",
+                mappedSpeakerId ?? "<none>",
+                userIdForBroadcast,
+                finalName);
             _logger.LogInformation("Transcript mapped to {ParticipantName}: {Text}", finalName, text);
             await _transcriptAggregator.PublishAsync(new TranscriptFragment(
                 AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),

@@ -58,6 +58,9 @@ public sealed class ParticipantManager
         new(StringComparer.OrdinalIgnoreCase);
 
     private readonly ConcurrentDictionary<uint, ParticipantBinding> _bindings = new();
+    private readonly ConcurrentDictionary<string, string> _sessionUserToSpeakerMap = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> _speakerToUserMap = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<uint, string> _audioStreamToUserMap = new();
 
     private string _meetingKey = string.Empty;
 
@@ -75,6 +78,9 @@ public sealed class ParticipantManager
             _meetingKey = string.IsNullOrWhiteSpace(callOrMeetingId) ? Guid.NewGuid().ToString("N") : callOrMeetingId.Trim();
             _participants.Clear();
             _bindings.Clear();
+            _sessionUserToSpeakerMap.Clear();
+            _speakerToUserMap.Clear();
+            _audioStreamToUserMap.Clear();
             Interlocked.Exchange(ref _speakerCounter, 0);
             _logger.LogInformation("ParticipantManager reset for meeting key {MeetingKey}.", _meetingKey);
         }
@@ -84,6 +90,29 @@ public sealed class ParticipantManager
 
     public bool TryGetBinding(uint sourceId, out ParticipantBinding? binding) =>
         _bindings.TryGetValue(sourceId, out binding);
+
+    public bool TryResolveUserFromAudioStream(uint sourceId, out string userId)
+    {
+        userId = string.Empty;
+        if (_audioStreamToUserMap.TryGetValue(sourceId, out var mapped) && !string.IsNullOrWhiteSpace(mapped))
+        {
+            userId = mapped.Trim();
+            return true;
+        }
+
+        if (_bindings.TryGetValue(sourceId, out var b) && !string.IsNullOrWhiteSpace(b.EntraOid))
+        {
+            userId = b.EntraOid.Trim();
+            return true;
+        }
+
+        return false;
+    }
+
+    public string? TryGetSpeakerIdForUser(string userId) =>
+        string.IsNullOrWhiteSpace(userId)
+            ? null
+            : (_sessionUserToSpeakerMap.TryGetValue(userId.Trim(), out var sid) ? sid : null);
 
     /// <summary>
     /// Human-facing transcript label: <b>always</b> prefers Entra/Graph display name when <see cref="ParticipantBinding.EntraOid"/> is set;
@@ -174,6 +203,7 @@ public sealed class ParticipantManager
 
         displayName = string.IsNullOrWhiteSpace(displayName) ? participantId.Trim() : displayName.Trim();
         var pid = participantId.Trim();
+        GetOrCreateSpeakerIdForUser(pid);
 
         _participants.AddOrUpdate(
             pid,
@@ -227,6 +257,8 @@ public sealed class ParticipantManager
                 {
                     existing.EntraOid = incomingOid;
                     existing.IsFinal = true;
+                    existing.StableSpeakerLabel = GetOrCreateSpeakerIdForUser(incomingOid);
+                    _audioStreamToUserMap[sourceId] = incomingOid;
                 }
 
                 if (!string.IsNullOrWhiteSpace(inputDisplayName))
@@ -271,9 +303,11 @@ public sealed class ParticipantManager
         if (graphOrAuthoritative && !string.IsNullOrWhiteSpace(initialGraphOid))
         {
             binding.EntraOid = initialGraphOid;
-            binding.DisplayName = !string.IsNullOrWhiteSpace(inputDisplayName) ? inputDisplayName : stableLabel;
+            binding.StableSpeakerLabel = GetOrCreateSpeakerIdForUser(initialGraphOid);
+            binding.DisplayName = !string.IsNullOrWhiteSpace(inputDisplayName) ? inputDisplayName : binding.StableSpeakerLabel;
             RegisterParticipant(binding.EntraOid, binding.DisplayName, DateTime.UtcNow);
             binding.IsFinal = true;
+            _audioStreamToUserMap[sourceId] = initialGraphOid;
         }
         else
         {
@@ -293,6 +327,17 @@ public sealed class ParticipantManager
             reason);
 
         return null;
+    }
+
+    private string GetOrCreateSpeakerIdForUser(string userId)
+    {
+        var uid = userId.Trim();
+        return _sessionUserToSpeakerMap.GetOrAdd(uid, _ =>
+        {
+            var speakerId = $"Speaker {Interlocked.Increment(ref _speakerCounter)}";
+            _speakerToUserMap[speakerId] = uid;
+            return speakerId;
+        });
     }
 
     public bool TryResolveAudioSource(uint sourceId, out string participantId, out string displayName)
