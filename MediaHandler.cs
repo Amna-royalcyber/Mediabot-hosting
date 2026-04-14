@@ -39,15 +39,9 @@ public sealed class MediaHandler
 
         _audioSocket = mediaSession.AudioSocket;
         _audioSocket.AudioMediaReceived += OnAudioMediaReceived;
-        _audioSocket.DominantSpeakerChanged += (_, e) =>
-        {
-            var sid = Convert.ToUInt32(e.CurrentDominantSpeaker);
-            _participantAudioRouter.SetDominantSpeaker(sid);
-            _logger.LogDebug("Dominant speaker source id (MSI) set to {SourceId}", sid);
-        };
 
         _logger.LogInformation(
-            "Media session initialized with unmixed meeting audio. Speaker labels use immutable Teams source-id → Entra bindings (ParticipantManager).");
+            "Media session initialized with unmixed meeting audio; transcription uses per-stream Azure Speech after Graph stream→user mapping.");
         return mediaSession;
     }
 

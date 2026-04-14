@@ -19,7 +19,11 @@ public sealed class BotSettings
     public required string ClientId { get; init; }
     public required string ClientSecret { get; init; }
     public required string ServiceBaseUrl { get; init; }
-    public required string AwsRegion { get; init; }
+    /// <summary>Azure Speech resource key (Speech service).</summary>
+    public string? AzureSpeechKey { get; init; }
+
+    /// <summary>Azure region for Speech (e.g. eastus).</summary>
+    public string? AzureSpeechRegion { get; init; }
 
     /// <summary>Thumbprint of a TLS cert in Windows cert store (LocalMachine\My) used for Teams media mTLS.</summary>
     public required string MediaCertificateThumbprint { get; init; }
@@ -50,7 +54,7 @@ public sealed class BotSettings
     /// <summary>If true, partial transcripts are broadcast to SignalR. Default false (final-only, cleaner UI).</summary>
     public bool TranscriptBroadcastPartials { get; init; }
 
-    /// <summary>PCM coalescing window per chunk sent to AWS Transcribe (50–200 ms typical). Lower = lower latency.</summary>
+    /// <summary>PCM coalescing window for media processing (50–200 ms typical). Lower = lower latency.</summary>
     public int TranscribeAudioChunkMilliseconds { get; init; } = 100;
 
     /// <summary>Minimum milliseconds between partial transcript UI updates per participant (reduces flicker).</summary>
@@ -141,7 +145,7 @@ public sealed class BotService
             }
 
             _logger.LogInformation("Join request submitted to Graph.");
-            _logger.LogInformation("Per-participant Transcribe streams will start as unmixed audio arrives.");
+            _logger.LogInformation("Per-stream Azure Speech transcription starts when unmixed audio arrives and Graph has bound the stream id.");
         }
         finally
         {

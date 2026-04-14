@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Text.RegularExpressions;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
@@ -9,15 +8,11 @@ using Microsoft.Graph.Models;
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Tracks Teams meeting participants from Graph Communications roster updates and maps
-/// AWS Transcribe speaker ids (spk_0, spk_1, …) to Entra profiles by <b>first-seen user order</b>
-/// (excluding the bot application). AWS diarization may not match speaking order — labels are best-effort.
+/// Tracks Teams meeting participants from Graph Communications roster updates and maps media stream ids
+/// (<c>sourceId</c> from <c>mediaStreams</c>) to Entra identities before any transcription.
 /// </summary>
 public sealed class MeetingParticipantService
 {
-    /// <summary>AWS may send <c>spk_0</c> or a bare digit <c>0</c> depending on SDK/version.</summary>
-    private static readonly Regex AwsSpeakerIndex = new(@"^(?:spk_)?(\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
-
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly EntraUserResolver _entra;
     private readonly IParticipantManager _participantManager;
@@ -34,6 +29,9 @@ public sealed class MeetingParticipantService
     /// <summary>Teams audio <c>sourceId</c> → Entra object id from roster <c>mediaStreams</c> (links placeholders to real users).</summary>
     private readonly ConcurrentDictionary<uint, string> _audioSourceIdToAzureObjectId = new();
 
+    /// <summary>Teams media <c>sourceId</c> → Graph call participant resource id (intra meeting id).</summary>
+    private readonly ConcurrentDictionary<uint, string> _sourceIdToCallParticipantId = new();
+
     public MeetingParticipantService(
         TranscriptBroadcaster broadcaster,
         EntraUserResolver entra,
@@ -49,6 +47,7 @@ public sealed class MeetingParticipantService
     public void AttachToCall(ICall call, string botAzureAdApplicationClientId)
     {
         _audioSourceIdToAzureObjectId.Clear();
+        _sourceIdToCallParticipantId.Clear();
         lock (_lock)
         {
             _callParticipantIdToAzureUserId.Clear();
@@ -114,33 +113,29 @@ public sealed class MeetingParticipantService
         }
     }
 
-    /// <summary>Maps spk_N to the Nth human participant row (first-seen Azure AD user order).</summary>
-    public SpeakerResolution? TryResolveSpeaker(string? awsSpeakerId)
+    /// <summary>
+    /// Deterministic identity for a media stream: requires Graph <c>mediaStreams[].sourceId</c> → user mapping.
+    /// </summary>
+    public bool TryGetParticipantForMediaStream(uint sourceId, out string intraId, out string participantId, out string displayName)
     {
-        if (string.IsNullOrEmpty(awsSpeakerId))
+        intraId = string.Empty;
+        participantId = string.Empty;
+        displayName = string.Empty;
+        if (!_audioSourceIdToAzureObjectId.TryGetValue(sourceId, out var oid) || string.IsNullOrWhiteSpace(oid))
         {
-            return null;
+            return false;
         }
 
-        var m = AwsSpeakerIndex.Match(awsSpeakerId.Trim());
-        if (!m.Success || !int.TryParse(m.Groups[1].Value, out var idx) || idx < 0)
+        participantId = oid.Trim();
+        intraId = _sourceIdToCallParticipantId.TryGetValue(sourceId, out var callPid) ? callPid : string.Empty;
+        if (TryResolveAudioSourceToEntra(sourceId, out _, out var dn) && !string.IsNullOrWhiteSpace(dn))
         {
-            return null;
+            displayName = dn.Trim();
+            return true;
         }
 
-        lock (_lock)
-        {
-            if (idx < _rosterOrder.Count)
-            {
-                var e = _rosterOrder[idx];
-                return new SpeakerResolution(
-                    e.DisplayName,
-                    e.UserPrincipalName,
-                    e.AzureAdObjectId);
-            }
-        }
-
-        return null;
+        displayName = participantId;
+        return true;
     }
 
     /// <summary>Resolve Teams MSI/source id to Entra user using roster mediaStreams (when Graph lists source ids before audio bind upgrades).</summary>
@@ -361,6 +356,7 @@ public sealed class MeetingParticipantService
                 if (string.Equals(kv.Value, removedAzureId, StringComparison.OrdinalIgnoreCase))
                 {
                     _audioSourceIdToAzureObjectId.TryRemove(kv.Key, out _);
+                    _sourceIdToCallParticipantId.TryRemove(kv.Key, out _);
                 }
             }
         }
@@ -483,8 +479,6 @@ public sealed class MeetingParticipantService
         string DisplayName,
         string? UserPrincipalName);
 }
-
-public readonly record struct SpeakerResolution(string DisplayName, string? UserPrincipalName, string? AzureAdObjectId);
 
 public sealed record RosterParticipantDto(
     string CallParticipantId,

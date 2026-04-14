@@ -1,8 +1,7 @@
-using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Linq;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Resources;
@@ -10,42 +9,33 @@ using Microsoft.Skype.Bots.Media;
 
 namespace TeamsMediaBot;
 
+/// <summary>
+/// Routes each unmixed Teams media stream (stable <c>sourceId</c>) to Azure Speech. Mixed-only meetings are not transcribed.
+/// Identity comes from Graph roster <c>mediaStreams</c> before transcription (see <see cref="MeetingParticipantService"/>).
+/// </summary>
 public sealed class ParticipantAudioRouter
 {
     private readonly AudioProcessor _audioProcessor;
-    private readonly AwsTranscribeService _awsTranscribeService;
+    private readonly AzureSpeechTranscriptionService _azureSpeech;
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ParticipantManager _participantManager;
     private readonly ILogger<ParticipantAudioRouter> _logger;
-
-    /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
-    private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
 
     private ICall? _attachedCall;
     private string _botClientId = string.Empty;
     private readonly object _rescanLock = new();
     private DateTime _lastParticipantRescanUtc = DateTime.MinValue;
-
-    private int _loggedMixedMode;
-    private int _loggedDominantNotYetMixed;
-    private int _loggedUnknownMixedFallback;
-
-    private readonly object _inferLock = new();
-
-    /// <summary>Last time we saw PCM for this MSI (unmixed chunk or dominant-speaker event). Used for mixed-mode “recent speakers” only.</summary>
-    private readonly ConcurrentDictionary<uint, DateTime> _lastSeenAudio = new();
-
-    private static readonly TimeSpan RecentSpeakerWindow = TimeSpan.FromSeconds(2);
+    private int _loggedNoUnmixed;
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
-        AwsTranscribeService awsTranscribeService,
+        AzureSpeechTranscriptionService azureSpeech,
         MeetingParticipantService meetingParticipants,
         ParticipantManager participantManager,
         ILogger<ParticipantAudioRouter> logger)
     {
         _audioProcessor = audioProcessor;
-        _awsTranscribeService = awsTranscribeService;
+        _azureSpeech = azureSpeech;
         _meetingParticipants = meetingParticipants;
         _participantManager = participantManager;
         _logger = logger;
@@ -55,9 +45,6 @@ public sealed class ParticipantAudioRouter
     {
         _attachedCall = call;
         _botClientId = botClientId ?? string.Empty;
-        var none = (uint)DominantSpeakerChangedEventArgs.None;
-        _dominantSourceId = none;
-        _lastSeenAudio.Clear();
         lock (_rescanLock)
         {
             _lastParticipantRescanUtc = DateTime.MinValue;
@@ -70,17 +57,18 @@ public sealed class ParticipantAudioRouter
             {
                 UpsertParticipantMappings(p, bot);
             }
+
             foreach (var p in args.UpdatedResources)
             {
                 UpsertParticipantMappings(p, bot);
             }
+
             foreach (var p in args.RemovedResources)
             {
                 RemoveParticipantMappings(p);
             }
         };
 
-        // Roster may already contain participants before delta events; hydrate bindings immediately.
         TryHydrateFromCurrentRoster(call, bot);
     }
 
@@ -106,8 +94,12 @@ public sealed class ParticipantAudioRouter
         var unmixed = args.Buffer.UnmixedAudioBuffers;
         if (unmixed is null || !unmixed.Any())
         {
-            // Many Teams builds/skus still deliver only the main (mixed) buffer; unmixed may be empty forever.
-            await TrySendMainBufferMixedDominantAsync(args);
+            if (Interlocked.Increment(ref _loggedNoUnmixed) == 1)
+            {
+                _logger.LogInformation(
+                    "No unmixed audio buffers in this meeting; transcription requires unmixed participant audio (ReceiveUnmixedMeetingAudio). Mixed-only capture is not transcribed.");
+            }
+
             return;
         }
 
@@ -117,18 +109,6 @@ public sealed class ParticipantAudioRouter
             if (sourceId == (uint)DominantSpeakerChangedEventArgs.None)
             {
                 continue;
-            }
-
-            _lastSeenAudio[sourceId] = DateTime.UtcNow;
-
-            if (!_participantManager.TryResolveAudioSource(sourceId, out var participantId, out var displayName))
-            {
-                if (!TryApplyRosterMediaStreamMap(sourceId, out participantId, out displayName))
-                {
-                    EnsureSyntheticBinding(sourceId);
-                    participantId = string.Empty;
-                    displayName = string.Empty;
-                }
             }
 
             var payload = CopyUnmixedBuffer(ub.Data, ub.Length);
@@ -148,89 +128,15 @@ public sealed class ParticipantAudioRouter
                 continue;
             }
 
-            _logger.LogDebug("Audio received from {ParticipantName} ({ParticipantId}).", displayName, participantId);
-            await _awsTranscribeService.SendAudioChunkAsync(
-                sourceId,
-                displayName,
-                pcm,
-                ub.OriginalSenderTimestamp);
-        }
-    }
-
-    /// <summary>
-    /// Mixed meeting audio (single buffer) — attribute text only via <c>sourceId</c> → <see cref="ParticipantManager"/> (no roster name guessing).
-    /// </summary>
-    private async Task TrySendMainBufferMixedDominantAsync(AudioMediaReceivedEventArgs args)
-    {
-        var declaredLength = (int)args.Buffer.Length;
-        var extracted = AudioProcessor.ExtractBytes(args.Buffer);
-        if (declaredLength > 0 && extracted.Length == 0)
-        {
-            _logger.LogTrace("Main audio buffer had Length={Len} but ExtractBytes returned 0.", declaredLength);
-            return;
-        }
-
-        var pcm = _audioProcessor.ConvertToPcm(new AudioFrame(
-            Data: extracted,
-            Timestamp: args.Buffer.Timestamp,
-            Length: declaredLength,
-            Format: AudioFormat.Pcm16K));
-        if (pcm.Length == 0)
-        {
-            return;
-        }
-
-        var roster = _meetingParticipants.GetRosterSnapshot();
-        if (roster.Count == 0)
-        {
-            _logger.LogDebug("Main audio buffer received but roster is empty (participants not ingested yet).");
-            return;
-        }
-
-        if (!TryResolveMixedAttribution(
-                roster,
-                out var mixedSourceId,
-                out var mixedDisplayName,
-                out var mixedUserIdWhenNoStream))
-        {
-            mixedSourceId = null;
-            mixedDisplayName = string.Empty;
-            mixedUserIdWhenNoStream = null;
-            if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
+            if (_meetingParticipants.TryGetParticipantForMediaStream(sourceId, out _, out _, out var dn))
             {
-                _logger.LogWarning("No authoritative mixed attribution — sending audio without speaker identity (unknown source).");
+                _logger.LogDebug("PCM for stream {SourceId} ({Name}).", sourceId, dn);
             }
-        }
 
-        if (Interlocked.Increment(ref _loggedMixedMode) == 1)
-        {
-            _logger.LogInformation(
-                "Using mixed main audio buffer with dominant-speaker labeling (sourceId map + Teams dominant MSI). " +
-                "For per-person audio without mixing, enable unmixed meeting audio when the client supports it.");
-        }
-
-        await _awsTranscribeService.SendMixedDominantAudioAsync(
-            mixedSourceId,
-            mixedDisplayName,
-            mixedUserIdWhenNoStream,
-            pcm,
-            args.Buffer.Timestamp,
-            _dominantSourceId);
-    }
-
-    /// <summary>Teams raises dominant speaker MSI; must align with participant mediaStreams sourceId for correct names.</summary>
-    public void SetDominantSpeaker(uint sourceId)
-    {
-        _dominantSourceId = sourceId;
-        if (sourceId != (uint)DominantSpeakerChangedEventArgs.None)
-        {
-            _lastSeenAudio[sourceId] = DateTime.UtcNow;
+            await _azureSpeech.ProcessPcm16Async(sourceId, pcm, ub.OriginalSenderTimestamp);
         }
     }
 
-    /// <summary>
-    /// Graph often adds <c>mediaStreams</c> after the first audio frames. Delta callbacks can be missed; re-scan fixes Entra names for demos.
-    /// </summary>
     private void MaybeRescanParticipantMediaStreams()
     {
         var call = _attachedCall;
@@ -264,98 +170,6 @@ public sealed class ParticipantAudioRouter
         }
     }
 
-    /// <summary>
-    /// When <see cref="MeetingParticipantService"/> has already correlated MSI → Entra from <c>mediaStreams</c> (same parse as Graph), upgrade <see cref="ParticipantManager"/> from synthetic.
-    /// </summary>
-    private bool TryApplyRosterMediaStreamMap(uint sourceId, out string participantId, out string displayName)
-    {
-        participantId = string.Empty;
-        displayName = string.Empty;
-        if (!_meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var oid, out var dn))
-        {
-            return false;
-        }
-
-        lock (_inferLock)
-        {
-            _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
-            _awsTranscribeService.UpsertParticipant(oid, dn);
-            return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
-        }
-    }
-
-    private void EnsureSyntheticBinding(uint sourceId)
-    {
-        lock (_inferLock)
-        {
-            if (!_participantManager.HasBinding(sourceId))
-            {
-                _participantManager.TryBindAudioSource(sourceId, null, string.Empty, "SyntheticUntilGraph");
-            }
-        }
-    }
-
-    /// <summary>
-    /// Resolves mixed-audio attribution with strict determinism:
-    /// only when exactly one active sourceId is known. Otherwise emit unknown (no source assignment).
-    /// </summary>
-    private bool TryResolveMixedAttribution(
-        IReadOnlyList<RosterParticipantDto> roster,
-        out uint? sourceStreamId,
-        out string displayName,
-        out string? userIdWhenNoSourceStream)
-    {
-        sourceStreamId = null;
-        displayName = string.Empty;
-        userIdWhenNoSourceStream = null;
-        _ = roster;
-        var activeSources = GetActiveSourceIds();
-        if (activeSources.Count != 1)
-        {
-            if (Interlocked.Increment(ref _loggedDominantNotYetMixed) == 1)
-            {
-                _logger.LogWarning(
-                    "Mixed audio has {ActiveCount} active sourceIds; attribution disabled to prevent identity guessing.",
-                    activeSources.Count);
-            }
-            return false;
-        }
-
-        var onlySourceId = activeSources[0];
-        if (_participantManager.TryResolveAudioSource(onlySourceId, out _, out displayName))
-        {
-            sourceStreamId = onlySourceId;
-            return true;
-        }
-
-        if (TryApplyRosterMediaStreamMap(onlySourceId, out _, out displayName))
-        {
-            sourceStreamId = onlySourceId;
-            return true;
-        }
-
-        _participantManager.TryBindAudioSource(onlySourceId, null, string.Empty, "SyntheticDominantMixed");
-        if (_participantManager.TryResolveAudioSource(onlySourceId, out _, out displayName))
-        {
-            sourceStreamId = onlySourceId;
-            return true;
-        }
-
-        return false;
-    }
-
-    private List<uint> GetActiveSourceIds()
-    {
-        var now = DateTime.UtcNow;
-        return _lastSeenAudio
-            .Where(kvp => (now - kvp.Value) <= RecentSpeakerWindow)
-            .Select(kvp => kvp.Key)
-            .ToList();
-    }
-
-    /// <summary>
-    /// Prefer a dedicated stream/source id when the SDK exposes it; otherwise fall back to <see cref="UnmixedAudioBuffer.ActiveSpeakerId"/> (dominant).
-    /// </summary>
     private static uint ResolveUnmixedStreamSourceId(UnmixedAudioBuffer ub)
     {
         var none = (uint)DominantSpeakerChangedEventArgs.None;
@@ -381,7 +195,7 @@ public sealed class ParticipantAudioRouter
         }
         catch
         {
-            // fall through to ActiveSpeakerId
+            // fall through
         }
 
         return Convert.ToUInt32(ub.ActiveSpeakerId);
@@ -419,14 +233,10 @@ public sealed class ParticipantAudioRouter
             _participantManager.TryBindAudioSource(sourceId, pid, dn, "Graph");
             _logger.LogInformation("Bound sourceId {SourceId} -> {DisplayName} ({ParticipantId}).", sourceId, dn, pid);
         }
-
-        _awsTranscribeService.UpsertParticipant(pid, dn);
     }
 
     private void RemoveParticipantMappings(IParticipant participant)
     {
-        // AWS Transcribe sessions are keyed by immutable sourceId; do not tear down streams on roster leave
-        // (avoids identity churn and matches bind-once semantics).
     }
 
     private static byte[] CopyUnmixedBuffer(IntPtr ptr, long length)
@@ -440,5 +250,4 @@ public sealed class ParticipantAudioRouter
         Marshal.Copy(ptr, bytes, 0, (int)length);
         return bytes;
     }
-
 }

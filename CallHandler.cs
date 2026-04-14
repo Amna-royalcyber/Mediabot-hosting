@@ -14,7 +14,6 @@ public sealed class CallHandler
 {
     private readonly BotSettings _settings;
     private readonly MeetingParticipantService _meetingParticipants;
-    private readonly TranscriptionManager _transcriptionManager;
     private readonly ParticipantAudioRouter _participantAudioRouter;
     private readonly MeetingContextStore _meetingContext;
     private readonly ParticipantManager _participantManager;
@@ -28,7 +27,6 @@ public sealed class CallHandler
     public CallHandler(
         BotSettings settings,
         MeetingParticipantService meetingParticipants,
-        TranscriptionManager transcriptionManager,
         ParticipantAudioRouter participantAudioRouter,
         MeetingContextStore meetingContext,
         ParticipantManager participantManager,
@@ -38,7 +36,6 @@ public sealed class CallHandler
     {
         _settings = settings;
         _meetingParticipants = meetingParticipants;
-        _transcriptionManager = transcriptionManager;
         _participantAudioRouter = participantAudioRouter;
         _meetingContext = meetingContext;
         _participantManager = participantManager;
@@ -227,7 +224,6 @@ public sealed class CallHandler
         _speakerIdentityStore.ResetForNewMeeting();
         _participantManager.BeginNewMeeting(call.Id);
         _meetingParticipants.AttachToCall(call, _settings.ClientId);
-        _transcriptionManager.AttachToCall(call, _settings.ClientId);
         _participantAudioRouter.AttachToCall(call, _settings.ClientId);
         _meetingContext.SetMeetingId(call.Id);
         lock (_activeCallLock)

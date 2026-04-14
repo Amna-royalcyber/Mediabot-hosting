@@ -49,7 +49,8 @@ public static class Program
             ClientId = GetConfig(builder.Configuration, "BOT_CLIENT_ID", "AzureAd:ClientId"),
             ClientSecret = GetConfig(builder.Configuration, "BOT_CLIENT_SECRET", "AzureAd:ClientSecret"),
             ServiceBaseUrl = GetConfig(builder.Configuration, "BOT_SERVICE_BASE_URL", "Bot:CallbackUrl"),
-            AwsRegion = GetConfig(builder.Configuration, "AWS_REGION", "AWS:Region"),
+            AzureSpeechKey = ReadOptional(builder.Configuration, "BOT_AZURE_SPEECH_KEY", "Bot:AzureSpeechKey"),
+            AzureSpeechRegion = ReadOptional(builder.Configuration, "BOT_AZURE_SPEECH_REGION", "Bot:AzureSpeechRegion"),
             MediaCertificateThumbprint = GetConfig(builder.Configuration, "BOT_MEDIA_CERT_THUMBPRINT", "Media:CertificateThumbprint"),
             MediaPublicIp = GetConfig(builder.Configuration, "BOT_MEDIA_PUBLIC_IP", "Media:PublicIp"),
             MediaInstanceInternalPort = ReadInt(builder.Configuration, "BOT_MEDIA_INSTANCE_INTERNAL_PORT", "Media:InstanceInternalPort", 8445),
@@ -84,20 +85,13 @@ public static class Program
         builder.Services.AddSingleton<TranscriptionChunkManager>();
         builder.Services.AddSingleton<IChunkManager>(sp => sp.GetRequiredService<TranscriptionChunkManager>());
         builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptionChunkManager>());
-        builder.Services.AddSingleton<TranscriptBuffer>();
-        builder.Services.AddSingleton<TranscriptDeduplicator>();
         builder.Services.AddSingleton<TranscriptBroadcaster>();
         builder.Services.AddSingleton<SpeakerIdentityStore>();
-        builder.Services.AddSingleton<TranscriptAggregator>();
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<TranscriptAggregator>());
         builder.Services.AddSingleton<EntraUserResolver>();
         builder.Services.AddSingleton<MeetingParticipantService>();
-        builder.Services.AddSingleton<TranscriptIdentityResolver>();
         builder.Services.AddHostedService<IdentityBackfillService>();
-        builder.Services.AddSingleton<TranscriptionManager>();
-        builder.Services.AddSingleton<ParticipantAudioStreamHandler>();
+        builder.Services.AddSingleton<AzureSpeechTranscriptionService>();
         builder.Services.AddSingleton<ParticipantAudioRouter>();
-        builder.Services.AddSingleton<AwsTranscribeService>();
         builder.Services.AddSingleton<AudioProcessor>();
         builder.Services.AddSingleton<MediaHandler>();
         builder.Services.AddSingleton<CallHandler>();

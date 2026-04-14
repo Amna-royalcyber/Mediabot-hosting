@@ -47,7 +47,7 @@ public sealed class AudioProcessor
         _signal.Release();
     }
 
-    public async IAsyncEnumerable<ReadOnlyMemory<byte>> GetAwsCompatibleAudioStreamAsync(
+    public async IAsyncEnumerable<ReadOnlyMemory<byte>> GetPcm16ChunkStreamAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -56,7 +56,6 @@ public sealed class AudioProcessor
 
             while (_bufferedChunks.TryDequeue(out byte[]? chunk))
             {
-                // AWS Transcribe streaming accepts linear PCM chunks over a continuous stream.
                 yield return chunk;
             }
         }

@@ -1,16 +1,14 @@
 using System.Collections.Concurrent;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Central speaker identity keyed by Teams media <c>sourceId</c> (MSI). Used for deferred display names and transcript backfill.
+/// Central speaker identity keyed by Teams media <c>sourceId</c> (MSI). Synced from <see cref="ParticipantManager"/> bindings.
 /// </summary>
 public sealed class SpeakerIdentityStore
 {
     private readonly TranscriptBroadcaster _broadcaster;
-    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<SpeakerIdentityStore> _logger;
 
     /// <summary>Media source id → participant identity (Entra may arrive late).</summary>
@@ -19,18 +17,13 @@ public sealed class SpeakerIdentityStore
     /// <summary>Entra object id → media source id (inverse lookup).</summary>
     public ConcurrentDictionary<string, uint> EntraToSource { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Final lines emitted before identity resolution (diagnostics / optional line-level tooling).</summary>
-    public ConcurrentDictionary<uint, List<SpeakerTranscriptRecord>> PendingTranscripts { get; } = new();
-
     private readonly ConcurrentDictionary<uint, (string Entra, string Name)> _lastResolutionBroadcast = new();
 
     public SpeakerIdentityStore(
         TranscriptBroadcaster broadcaster,
-        IServiceScopeFactory scopeFactory,
         ILogger<SpeakerIdentityStore> logger)
     {
         _broadcaster = broadcaster;
-        _scopeFactory = scopeFactory;
         _logger = logger;
     }
 
@@ -38,7 +31,6 @@ public sealed class SpeakerIdentityStore
     {
         SourceToParticipant.Clear();
         EntraToSource.Clear();
-        PendingTranscripts.Clear();
         _lastResolutionBroadcast.Clear();
     }
 
@@ -118,44 +110,15 @@ public sealed class SpeakerIdentityStore
         }
     }
 
-    public void RegisterPendingTranscript(uint sourceId, SpeakerTranscriptRecord transcriptEvent)
-    {
-        var list = PendingTranscripts.GetOrAdd(sourceId, _ => new List<SpeakerTranscriptRecord>());
-        lock (list)
-        {
-            list.Add(transcriptEvent);
-        }
-    }
-
-    public void ApplyFinalDisplayNameToPending(uint sourceId, string? finalName)
-    {
-        if (!PendingTranscripts.TryGetValue(sourceId, out var list))
-        {
-            return;
-        }
-
-        lock (list)
-        {
-            foreach (var e in list)
-            {
-                e.FinalDisplayName = finalName;
-            }
-        }
-    }
-
     private async Task PublishResolvedAsync(uint sourceId, string? entraOid, string? displayName)
     {
         try
         {
-            ApplyFinalDisplayNameToPending(sourceId, displayName);
             await _broadcaster.BroadcastTranscriptIdentityUpdateAsync(sourceId, displayName, entraOid);
-            using var scope = _scopeFactory.CreateScope();
-            var aggregator = scope.ServiceProvider.GetRequiredService<TranscriptAggregator>();
-            await aggregator.ResolvePendingAsync(sourceId);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Identity backfill failed for sourceId {SourceId}.", sourceId);
+            _logger.LogDebug(ex, "Identity broadcast failed for sourceId {SourceId}.", sourceId);
         }
     }
 }
@@ -166,15 +129,4 @@ public sealed class ParticipantIdentity
     public string? EntraUserId { get; set; }
     public string? DisplayName { get; set; }
     public bool IsResolved { get; set; }
-}
-
-/// <summary>
-/// One final transcript line tied to a media source id before Entra/display name is known (not AWS SDK <c>TranscriptEvent</c>).
-/// </summary>
-public sealed class SpeakerTranscriptRecord
-{
-    public required string Text { get; set; }
-    public required uint SourceId { get; set; }
-    public required DateTime Timestamp { get; set; }
-    public string? FinalDisplayName { get; set; }
 }

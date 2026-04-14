@@ -409,7 +409,7 @@ public sealed class ParticipantManager : IParticipantManager
         using var scope = _scopeFactory.CreateScope();
         var store = scope.ServiceProvider.GetRequiredService<SpeakerIdentityStore>();
         store.OnParticipantBindingUpdated(b);
-        scope.ServiceProvider.GetRequiredService<AwsTranscribeService>().NotifySourceIdentityResolved(sourceId);
+        scope.ServiceProvider.GetRequiredService<AzureSpeechTranscriptionService>().NotifyParticipantIdentityResolved(sourceId);
     }
 
     private string GetOrCreateSpeakerIdForUser(string userId)

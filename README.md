@@ -1,6 +1,6 @@
 # Teams Media Bot (VM-hosted)
 
-ASP.NET Core app that joins Microsoft Teams meetings using the **Microsoft Graph Communications SDK** with **application-hosted media**: audio is received on your Windows VM, processed, and streamed to **Amazon Transcribe** (streaming). Transcripts can be pushed to browsers via **SignalR**.
+ASP.NET Core app that joins Microsoft Teams meetings using the **Microsoft Graph Communications SDK** with **application-hosted media**: **unmixed** participant audio is received on your Windows VM, routed **per media stream id** (`sourceId`), and transcribed with the **Azure Cognitive Services Speech SDK**. Transcripts are pushed to browsers via **SignalR** (identity comes from Graph roster / `mediaStreams` **before** transcription).
 
 ---
 
@@ -24,13 +24,7 @@ ASP.NET Core app that joins Microsoft Teams meetings using the **Microsoft Graph
 | **Azure Bot + Teams channel** | Bot registered in Azure; **Microsoft Teams** channel enabled; **Messaging endpoint** / callback must match your public HTTPS URL. |
 | **Teams application access policy** | Your app’s client ID must be allowed in a **Teams application access policy** and assigned appropriately (`New-CsApplicationAccessPolicy` / `Grant-CsApplicationAccessPolicy`). Without this, Graph often returns **403** *Call source identity invalid*. |
 | **Meeting join link** | Prefer a full **meetup-join** URL that includes `context` with **Tid** and **Oid** (organizer). |
-
-### AWS
-
-| Requirement | Notes |
-|-------------|--------|
-| **Credentials on the VM** | Default SDK chain (e.g. instance profile, env vars, or shared credentials) for **Transcribe Streaming**. |
-| **IAM** | Permission to call **Amazon Transcribe streaming** in the chosen region (`AWS_REGION` / `AWS:Region`). |
+| **Azure Speech resource** | Create a **Speech** resource in Azure; use its **key** and **region** (`Bot:AzureSpeechKey` / `Bot:AzureSpeechRegion` or env vars below). |
 
 ### Optional
 
@@ -65,8 +59,7 @@ Values are read from **environment variables first**, then **`appsettings.json`*
 | Section | Purpose |
 |---------|--------|
 | `AzureAd` | `TenantId`, `ClientId`, `ClientSecret` for client-credentials Graph token. The **Graph Communications** logger and client builder use **`ClientId`** as the application identifier (no separate display name). **Do not commit production secrets**; use env vars or a secret store. |
-| `Bot` | `CallbackUrl` — full HTTPS URL to **`/callback`** (or the path your Azure Bot uses). |
-| `AWS` | `Region` for Transcribe (overridable by `AWS_REGION`). |
+| `Bot` | `CallbackUrl` — full HTTPS URL to **`/callback`**; **`AzureSpeechKey`** / **`AzureSpeechRegion`** for Speech SDK; optional **`TranscriptAlbEndpoint`**. |
 | `Media` | Certificate thumbprint, public IP, internal/public ports (**8445**), **`ServiceFqdn`** (must match cert **CN/SAN** even if callback host differs). |
 
 ### Environment variables (override config)
@@ -77,12 +70,13 @@ Values are read from **environment variables first**, then **`appsettings.json`*
 | `BOT_CLIENT_ID` | `AzureAd:ClientId` |
 | `BOT_CLIENT_SECRET` | `AzureAd:ClientSecret` |
 | `BOT_SERVICE_BASE_URL` | `Bot:CallbackUrl` |
+| `BOT_AZURE_SPEECH_KEY` | `Bot:AzureSpeechKey` |
+| `BOT_AZURE_SPEECH_REGION` | `Bot:AzureSpeechRegion` |
 | `BOT_MEDIA_CERT_THUMBPRINT` | `Media:CertificateThumbprint` |
 | `BOT_MEDIA_PUBLIC_IP` | `Media:PublicIp` |
 | `BOT_MEDIA_INSTANCE_INTERNAL_PORT` | `Media:InstanceInternalPort` |
 | `BOT_MEDIA_INSTANCE_PUBLIC_PORT` | `Media:InstancePublicPort` |
 | `BOT_MEDIA_SERVICE_FQDN` | `Media:ServiceFqdn` (**use when callback host ≠ cert name**) |
-| `AWS_REGION` | AWS region for Transcribe |
 | `BOT_TRANSCRIPT_ALB_ENDPOINT` | `Bot:TranscriptAlbEndpoint` (receives 3-minute transcript JSON batches) |
 
 ---
@@ -91,7 +85,7 @@ Values are read from **environment variables first**, then **`appsettings.json`*
 
 | Path | Role |
 |------|------|
-| **`TeamsMediaBot.csproj`** | SDK project; **x64**, NuGet packages (Graph Communications, Skype Bots Media, AWS Transcribe). Copies native media DLLs on build/publish. |
+| **`TeamsMediaBot.csproj`** | SDK project; **x64**, NuGet packages (Graph Communications, Skype Bots Media, Azure Speech). Copies native media DLLs on build/publish. |
 | **`Program.cs`** | App entry: DI, **`BotSettings`**, forwarded headers, SignalR, static files, **all HTTP routes** (join APIs, Graph callbacks). |
 | **`BotService.cs`** | Builds **`ICommunicationsClient`** (auth, callback URL, **media platform settings**, Graph base URL). **`JoinMeetingAsync`**, **`ProcessNotificationAsync`**. |
 | **`BotSettings`** (in `BotService.cs`) | Strongly typed configuration injected from `Program`. |
@@ -99,9 +93,11 @@ Values are read from **environment variables first**, then **`appsettings.json`*
 | **`CallHandler.cs`** | Parses Teams **join URLs** (and optional **coordinates**), builds **`JoinMeetingParameters`**, calls **`Calls().AddAsync`**. Sets organizer **tenant** (`SetTenantId`) and **reply-chain** message id when present in URL context. |
 | **`MeetingJoinParser.cs`** | Extracts thread id / optional passcode from a URL for API responses and correlation. |
 | **`BotApiModels.cs`** | **`JoinMeetingRequest`** JSON model for join endpoints. |
-| **`MediaHandler.cs`** | Creates **app-hosted** **`IMediaSession`** (PCM 16 kHz receive); subscribes to **`AudioMediaReceived`** and forwards audio downstream. |
-| **`AudioProcessor.cs`** | Converts/buffers raw audio frames for streaming. |
-| **`AwsTranscribeService.cs`** | Starts **Amazon Transcribe streaming**; consumes PCM chunks; raises transcript events. |
+| **`MediaHandler.cs`** | Creates **app-hosted** **`IMediaSession`** (PCM 16 kHz, **unmixed** receive); subscribes to **`AudioMediaReceived`**. |
+| **`ParticipantAudioRouter.cs`** | Maps each unmixed buffer’s **`sourceId`** to roster identity and forwards PCM to **`AzureSpeechTranscriptionService`**. |
+| **`AzureSpeechTranscriptionService.cs`** | One **SpeechRecognizer** per stream; emits structured transcripts (intra id, participant id, display name, stream id). |
+| **`MeetingParticipantService.cs`** | Roster + **`mediaStreams`** → **sourceId** → Entra / call participant id **before** speech. |
+| **`AudioProcessor.cs`** | Converts/buffers raw audio frames. |
 | **`TranscriptBroadcaster.cs`** | Sends transcript payloads to **SignalR** clients. |
 | **`TranscriptHub.cs`** | SignalR hub for `/hubs/transcripts`. |
 | **`appsettings.json`** | Default configuration (replace secrets via env in production). |
@@ -134,7 +130,8 @@ Ensure the **Skype native DLLs** are present in the output folder (the project r
 |---------|----------------|
 | **403** *Call source identity invalid* | Teams **application access policy** missing your **ClientId**, or organizer’s user policy doesn’t include it. |
 | **Media platform failed to initialize** / FQDN vs cert mismatch | Set **`Media:ServiceFqdn`** or **`BOT_MEDIA_SERVICE_FQDN`** to the **exact hostname on the certificate** (may differ from callback host). |
-| No audio / no transcripts | Join must **succeed** first; check Graph callbacks reach **`/callback`**; verify media **IP/port** and firewall. |
+| No audio / no transcripts | Join must **succeed** first; check Graph callbacks reach **`/callback`**; verify media **IP/port** and firewall. Meetings must expose **unmixed** audio (`ReceiveUnmixedMeetingAudio`). |
+| No Speech output | Set **`Bot:AzureSpeechKey`** and **`Bot:AzureSpeechRegion`** (or env). |
 
 ---
 
