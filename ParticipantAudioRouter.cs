@@ -328,11 +328,9 @@ public sealed class ParticipantAudioRouter
                 return true;
             }
 
-            // Safe fast-bind: if there is exactly one human in roster, bind this MSI directly.
-            if (roster.Count == 1 && !string.IsNullOrWhiteSpace(roster[0].AzureAdObjectId))
+            // Safe fast-bind: if there is exactly one unique Entra user in roster, bind this MSI directly.
+            if (TryGetSingleUniqueRosterIdentity(roster, out var oid, out var dn))
             {
-                var oid = roster[0].AzureAdObjectId.Trim();
-                var dn = string.IsNullOrWhiteSpace(roster[0].DisplayName) ? oid : roster[0].DisplayName.Trim();
                 _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
                 _awsTranscribeService.UpsertParticipant(oid, dn);
                 _logger.LogInformation("Single-roster fast bind sourceId {SourceId} -> {DisplayName} ({EntraOid}).", sourceId, dn, oid);
@@ -407,6 +405,46 @@ public sealed class ParticipantAudioRouter
         }
 
         return false;
+    }
+
+    private static bool TryGetSingleUniqueRosterIdentity(
+        IReadOnlyList<RosterParticipantDto> roster,
+        out string entraOid,
+        out string displayName)
+    {
+        entraOid = string.Empty;
+        displayName = string.Empty;
+        if (roster.Count == 0)
+        {
+            return false;
+        }
+
+        var unique = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in roster)
+        {
+            if (string.IsNullOrWhiteSpace(p.AzureAdObjectId))
+            {
+                continue;
+            }
+
+            var oid = p.AzureAdObjectId.Trim();
+            if (unique.ContainsKey(oid))
+            {
+                continue;
+            }
+
+            unique[oid] = string.IsNullOrWhiteSpace(p.DisplayName) ? oid : p.DisplayName.Trim();
+        }
+
+        if (unique.Count != 1)
+        {
+            return false;
+        }
+
+        var only = unique.First();
+        entraOid = only.Key;
+        displayName = only.Value;
+        return true;
     }
 
     private List<uint> GetActiveSourceIds()
