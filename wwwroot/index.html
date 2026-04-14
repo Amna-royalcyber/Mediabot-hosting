@@ -110,7 +110,10 @@
       const who = label
         ? `<span class="speaker">${escapeHtml(label)}</span>`
         : "";
-      line.innerHTML = `${who}<span class="text">${escapeHtml(String(text))}</span>`;
+      const oid = aad
+        ? ` <span class="aad-id" title="Microsoft Entra object ID">${escapeHtml(String(aad))}</span>`
+        : "";
+      line.innerHTML = `${who}<span class="text">${escapeHtml(String(text))}</span>${oid}`;
       transcriptsEl.prepend(line);
     });
 

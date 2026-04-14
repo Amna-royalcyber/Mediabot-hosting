@@ -29,6 +29,7 @@ public sealed class ParticipantAudioRouter
     private int _loggedMixedMode;
     private int _loggedDominantNotYetMixed;
     private int _loggedMultiParticipantInferenceSkipped;
+    private int _loggedUnknownMixedFallback;
 
     private readonly object _inferLock = new();
 
@@ -199,10 +200,31 @@ public sealed class ParticipantAudioRouter
                 out var mixedDisplayName,
                 out var mixedUserIdWhenNoStream))
         {
-            _logger.LogWarning("No attribution available — sending mixed audio with UNKNOWN speaker.");
-            mixedSourceId = null;
-            mixedDisplayName = "Speaker";
-            mixedUserIdWhenNoStream = null;
+            if (roster.Count == 1 && !string.IsNullOrWhiteSpace(roster[0].AzureAdObjectId))
+            {
+                mixedSourceId = null;
+                mixedUserIdWhenNoStream = roster[0].AzureAdObjectId.Trim();
+                mixedDisplayName = string.IsNullOrWhiteSpace(roster[0].DisplayName)
+                    ? mixedUserIdWhenNoStream
+                    : roster[0].DisplayName.Trim();
+                if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
+                {
+                    _logger.LogInformation(
+                        "Mixed audio has no source attribution yet; using single-roster Entra fallback {DisplayName} ({EntraOid}).",
+                        mixedDisplayName,
+                        mixedUserIdWhenNoStream);
+                }
+            }
+            else
+            {
+                mixedSourceId = null;
+                mixedDisplayName = "Speaker";
+                mixedUserIdWhenNoStream = null;
+                if (Interlocked.Increment(ref _loggedUnknownMixedFallback) == 1)
+                {
+                    _logger.LogWarning("No attribution available — sending mixed audio with UNKNOWN speaker.");
+                }
+            }
         }
 
         if (Interlocked.Increment(ref _loggedMixedMode) == 1)
