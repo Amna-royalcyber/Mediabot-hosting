@@ -72,14 +72,13 @@ public sealed class TranscriptionManager : IAsyncDisposable
 
         if (!_participantBySourceId.TryGetValue(sourceId, out var participant))
         {
-            var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
             var label = _participantManager.GetTranscriptSpeakerLabel(sourceId);
             if (string.IsNullOrWhiteSpace(label))
             {
-                label = "Unknown";
+                label = string.Empty;
             }
 
-            var syn = new TranscribeParticipantSnapshot(syntheticId, label);
+            var syn = new TranscribeParticipantSnapshot(string.Empty, label);
             if (_participantBySourceId.TryAdd(sourceId, syn))
             {
                 participant = syn;

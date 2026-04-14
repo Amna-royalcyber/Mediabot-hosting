@@ -126,7 +126,7 @@ public sealed class ParticipantAudioRouter
                 if (!TryApplyRosterMediaStreamMap(sourceId, out participantId, out displayName))
                 {
                     EnsureSyntheticBinding(sourceId);
-                    participantId = ParticipantManager.SyntheticParticipantId(sourceId);
+                    participantId = string.Empty;
                     displayName = string.Empty;
                 }
             }
@@ -214,7 +214,8 @@ public sealed class ParticipantAudioRouter
             mixedDisplayName,
             mixedUserIdWhenNoStream,
             pcm,
-            args.Buffer.Timestamp);
+            args.Buffer.Timestamp,
+            _dominantSourceId);
     }
 
     /// <summary>Teams raises dominant speaker MSI; must align with participant mediaStreams sourceId for correct names.</summary>

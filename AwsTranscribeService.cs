@@ -25,6 +25,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private readonly object _mixedLock = new();
     private ParticipantTranscribeSession? _mixedDominantSession;
     private volatile bool _isDisposing;
+    private readonly UnmixedAudioDelayGate _unmixedGate;
+    private readonly MixedDominantAudioDelayGate _mixedGate;
 
     public AwsTranscribeService(
         BotSettings settings,
@@ -36,6 +38,19 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         _transcriptAggregator = transcriptAggregator;
         _participantManager = participantManager;
         _logger = logger;
+        _unmixedGate = new UnmixedAudioDelayGate(settings, participantManager, SendAudioChunkDirectAsync);
+        _mixedGate = new MixedDominantAudioDelayGate(settings, participantManager, SendMixedDominantDirectAsync);
+    }
+
+    /// <summary>Drains delayed PCM when Entra is mapped for this <paramref name="sourceId"/>.</summary>
+    public void NotifySourceIdentityResolved(uint sourceId)
+    {
+        if (_isDisposing)
+        {
+            return;
+        }
+
+        _ = _unmixedGate.OnIdentityResolvedAsync(sourceId);
     }
 
     /// <summary>Roster display cache only; does not create or move Transcribe sessions (sessions are per <c>sourceId</c>).</summary>
@@ -49,7 +64,10 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         _participantManager.RegisterParticipant(participantId.Trim(), displayName, DateTime.UtcNow);
     }
 
-    public async Task SendAudioChunkAsync(uint sourceId, string displayName, byte[] pcmAudio, long timestamp)
+    public Task SendAudioChunkAsync(uint sourceId, string displayName, byte[] pcmAudio, long timestamp) =>
+        _unmixedGate.EnqueueAsync(sourceId, displayName, pcmAudio, timestamp);
+
+    private async Task SendAudioChunkDirectAsync(uint sourceId, string displayName, byte[] pcmAudio, long timestamp)
     {
         if (_isDisposing || pcmAudio.Length == 0)
         {
@@ -70,10 +88,18 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends PCM from the main (mixed) buffer to one Transcribe stream. Identity per utterance comes from
-    /// <paramref name="sourceStreamId"/> when known, else <paramref name="userIdWhenNoSourceStream"/> (e.g. sole roster Entra id).
+    /// Sends PCM from the main (mixed) buffer. Buffered until Entra exists for the attributed source or the identity window elapses.
     /// </summary>
-    public async Task SendMixedDominantAudioAsync(
+    public Task SendMixedDominantAudioAsync(
+        uint? sourceStreamId,
+        string displayName,
+        string? userIdWhenNoSourceStream,
+        byte[] pcmAudio,
+        long timestamp,
+        uint dominantSpeakerMsi) =>
+        _mixedGate.EnqueueAsync(sourceStreamId, displayName, userIdWhenNoSourceStream, pcmAudio, timestamp, dominantSpeakerMsi);
+
+    private async Task SendMixedDominantDirectAsync(
         uint? sourceStreamId,
         string displayName,
         string? userIdWhenNoSourceStream,
@@ -108,6 +134,8 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _isDisposing = true;
+        await _unmixedGate.DisposeAsync();
+        await _mixedGate.DisposeAsync();
         foreach (var session in _sessionsBySourceId.Values)
         {
             await session.DisposeAsync();
@@ -367,7 +395,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 sourceForFragment = _fixedSourceStreamId ?? _mixedActiveSourceId;
                 if (sourceForFragment is uint sid)
                 {
-                    userIdForBroadcast = ParticipantManager.SyntheticParticipantId(sid);
+                    userIdForBroadcast = _participantManager.TryResolveUserFromAudioStream(sid, out var uid) ? uid : string.Empty;
                     displayName = _participantManager.GetTranscriptSpeakerLabel(sid);
                     if (string.IsNullOrWhiteSpace(displayName))
                     {
@@ -382,7 +410,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 }
                 else
                 {
-                    userIdForBroadcast = AwsTranscribeService.UnknownMixedUserId;
+                    userIdForBroadcast = string.Empty;
                     displayName = string.IsNullOrWhiteSpace(_mixedDisplayName) ? string.Empty : _mixedDisplayName.Trim();
                     sourceForFragment = null;
                 }
@@ -409,7 +437,16 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 _lastPartial = text;
                 _lastPartialUtc = DateTime.UtcNow;
                 var partialEmitted = DateTime.UtcNow;
-                var partialName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
+                string partialName;
+                if (sourceForFragment is uint psid)
+                {
+                    var plab = _participantManager.GetTranscriptSpeakerLabel(psid);
+                    partialName = string.IsNullOrWhiteSpace(plab) ? displayName : plab;
+                }
+                else
+                {
+                    partialName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
+                }
                 await _transcriptAggregator.PublishAsync(new TranscriptFragment(
                     AudioTimestamp: (long)((result.StartTime ?? 0) * 10_000_000),
                     EmittedAtUtc: partialEmitted,
@@ -433,7 +470,16 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
 
             _lastFinalDedupeKey = dedupeKey;
             var finalEmitted = DateTime.UtcNow;
-            var finalName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
+            string finalName;
+            if (sourceForFragment is uint fsid2)
+            {
+                var slab = _participantManager.GetTranscriptSpeakerLabel(fsid2);
+                finalName = string.IsNullOrWhiteSpace(slab) ? displayName : slab;
+            }
+            else
+            {
+                finalName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ?? displayName;
+            }
             string? mappedUserId = null;
             string? mappedSpeakerId = null;
             if (sourceForFragment is uint fsid && _participantManager.TryResolveUserFromAudioStream(fsid, out var resolvedUserId))

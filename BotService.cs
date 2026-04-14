@@ -61,6 +61,12 @@ public sealed class BotSettings
 
     /// <summary>Optional ALB endpoint that receives 3-minute transcript JSON payloads.</summary>
     public string? TranscriptAlbEndpoint { get; init; }
+
+    /// <summary>Wait up to this many ms for Entra mapping before sending buffered PCM to Transcribe (5000–10000).</summary>
+    public int IdentityAudioBufferMilliseconds { get; init; } = 7000;
+
+    /// <summary>How often to retry roster/mediaStreams → Entra correlation for unresolved sources.</summary>
+    public int IdentityResolutionRetrySeconds { get; init; } = 2;
 }
 
 public sealed class BotService

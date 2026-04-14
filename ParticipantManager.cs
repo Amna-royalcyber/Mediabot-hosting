@@ -25,7 +25,7 @@ public sealed class ParticipantBinding
 {
     public uint SourceId { get; init; }
 
-    /// <summary>Stable internal/AWS session key: <c>msi-pending-{SourceId}</c>. Never reassigned.</summary>
+    /// <summary>Optional legacy correlation; identity is keyed by <see cref="SourceId"/> and <see cref="EntraOid"/>.</summary>
     public string StreamParticipantId { get; init; } = "";
 
     /// <summary>Microsoft Entra object id when known (Graph or hint). May start null.</summary>
@@ -103,6 +103,12 @@ public sealed class ParticipantManager : IParticipantManager
 
     public bool HasBinding(uint sourceId) => _bindings.ContainsKey(sourceId);
 
+    /// <summary>True when Graph has provided an Entra object id for this media source (authoritative mapping).</summary>
+    public bool HasEntraOidForSource(uint sourceId) =>
+        _bindings.TryGetValue(sourceId, out var b) &&
+        b is not null &&
+        !string.IsNullOrWhiteSpace(b.EntraOid);
+
     public bool TryGetBinding(uint sourceId, out ParticipantBinding? binding) =>
         _bindings.TryGetValue(sourceId, out binding);
 
@@ -178,12 +184,12 @@ public sealed class ParticipantManager : IParticipantManager
         return string.IsNullOrWhiteSpace(b.StableSpeakerLabel) ? string.Empty : b.StableSpeakerLabel.Trim();
     }
 
-    /// <summary>Entra OID for ALB/SignalR: confirmed OID, else hint, else stable stream id string.</summary>
+    /// <summary>Entra OID for ALB/SignalR when resolved; empty string if not yet mapped (clients use <c>sourceId</c>).</summary>
     public string GetEntraOidForTranscript(uint sourceId)
     {
         if (!_bindings.TryGetValue(sourceId, out var b))
         {
-            return SyntheticParticipantId(sourceId);
+            return string.Empty;
         }
 
         if (!string.IsNullOrWhiteSpace(b.EntraOid))
@@ -191,7 +197,7 @@ public sealed class ParticipantManager : IParticipantManager
             return b.EntraOid.Trim();
         }
 
-        return b.StreamParticipantId;
+        return string.Empty;
     }
 
     /// <summary>Legacy path: resolve synthetic session id to Entra/stream for payloads.</summary>
@@ -345,11 +351,10 @@ public sealed class ParticipantManager : IParticipantManager
         }
 
         // First bind only — hard block reassignment is implicit (key did not exist).
-        var streamPid = SyntheticParticipantId(sourceId);
         var binding = new ParticipantBinding
         {
             SourceId = sourceId,
-            StreamParticipantId = streamPid,
+            StreamParticipantId = string.Empty,
             StableSpeakerLabel = string.Empty,
             State = IdentityState.PartiallyResolved
         };
@@ -384,9 +389,8 @@ public sealed class ParticipantManager : IParticipantManager
         _bindings[sourceId] = binding;
 
         _logger.LogInformation(
-            "Created binding sourceId {SourceId} → stream {StreamId}; EntraOid={Entra}; IsFinal={Final} [{Reason}].",
+            "Created binding sourceId {SourceId}; EntraOid={Entra}; IsFinal={Final} [{Reason}].",
             sourceId,
-            streamPid,
             binding.EntraOid,
             binding.IsFinal,
             reason);
@@ -405,6 +409,7 @@ public sealed class ParticipantManager : IParticipantManager
         using var scope = _scopeFactory.CreateScope();
         var store = scope.ServiceProvider.GetRequiredService<SpeakerIdentityStore>();
         store.OnParticipantBindingUpdated(b);
+        scope.ServiceProvider.GetRequiredService<AwsTranscribeService>().NotifySourceIdentityResolved(sourceId);
     }
 
     private string GetOrCreateSpeakerIdForUser(string userId)

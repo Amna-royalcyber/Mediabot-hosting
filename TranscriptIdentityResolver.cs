@@ -1,7 +1,7 @@
 namespace TeamsMediaBot;
 
 /// <summary>
-/// Maps <c>msi-pending-{sourceId}</c> placeholders to Microsoft Entra object ids and display names using
+/// Maps media <c>sourceId</c> to Microsoft Entra object ids and display names using
 /// <see cref="ParticipantManager"/> bindings and roster <c>mediaStreams</c> correlation.
 /// </summary>
 public sealed class TranscriptIdentityResolver
@@ -70,13 +70,13 @@ public sealed class TranscriptIdentityResolver
                 _participantManager.TryGetBinding(sourceId, out binding);
                 if (binding is null)
                 {
-                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? string.Empty : dn);
+                    return (string.Empty, string.IsNullOrWhiteSpace(dn) ? string.Empty : dn);
                 }
             }
 
             var uid = !string.IsNullOrWhiteSpace(binding.EntraOid)
                 ? binding.EntraOid.Trim()
-                : ParticipantManager.SyntheticParticipantId(sourceId);
+                : string.Empty;
 
             var name = _participantManager.GetTranscriptSpeakerLabel(sourceId);
             if (string.IsNullOrWhiteSpace(name))
@@ -93,12 +93,12 @@ public sealed class TranscriptIdentityResolver
             return (entraOid, rosterName);
         }
 
-        var fallbackName = _participantManager.GetCanonicalDisplayName(ParticipantManager.SyntheticParticipantId(sourceId));
+        var fallbackName = _participantManager.GetTranscriptSpeakerLabel(sourceId);
         if (string.IsNullOrWhiteSpace(fallbackName))
         {
             fallbackName = string.IsNullOrWhiteSpace(dn) ? string.Empty : dn;
         }
-        return (ParticipantManager.SyntheticParticipantId(sourceId), fallbackName);
+        return (string.Empty, fallbackName);
     }
 
     private static bool TryParseSyntheticSourceId(string uid, out uint sourceId)

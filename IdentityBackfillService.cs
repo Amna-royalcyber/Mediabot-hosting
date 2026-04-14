@@ -1,3 +1,4 @@
+using System.Linq;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -8,15 +9,18 @@ namespace TeamsMediaBot;
 /// </summary>
 public sealed class IdentityBackfillService : BackgroundService
 {
+    private readonly BotSettings _settings;
     private readonly IParticipantManager _participantManager;
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ILogger<IdentityBackfillService> _logger;
 
     public IdentityBackfillService(
+        BotSettings settings,
         IParticipantManager participantManager,
         MeetingParticipantService meetingParticipants,
         ILogger<IdentityBackfillService> logger)
     {
+        _settings = settings;
         _participantManager = participantManager;
         _meetingParticipants = meetingParticipants;
         _logger = logger;
@@ -24,7 +28,8 @@ public sealed class IdentityBackfillService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
+        var interval = TimeSpan.FromSeconds(Math.Clamp(_settings.IdentityResolutionRetrySeconds, 1, 30));
+        using var timer = new PeriodicTimer(interval);
         while (!stoppingToken.IsCancellationRequested && await timer.WaitForNextTickAsync(stoppingToken))
         {
             try
@@ -65,6 +70,15 @@ public sealed class IdentityBackfillService : BackgroundService
             if (_participantManager.TryGetSourceIdForIdentity(entry.Oid, out var resolvedSourceId))
             {
                 _participantManager.TryBindAudioSource(resolvedSourceId, entry.Oid, entry.DisplayName, "GraphBackfillRefresh");
+            }
+        }
+
+        // Retry: map mediaStreams sourceId → Entra when Graph adds correlation after first audio.
+        foreach (var sourceId in _participantManager.GetUnresolvedSourceIds().Distinct())
+        {
+            if (_meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var oid, out var name))
+            {
+                _participantManager.TryBindAudioSource(sourceId, oid, name, "RosterMediaStreamsMap");
             }
         }
     }
