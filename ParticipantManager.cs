@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 
 namespace TeamsMediaBot;
@@ -30,6 +31,9 @@ public sealed class ParticipantBinding
 
     public string DisplayName { get; set; } = "";
 
+    /// <summary>Stable human-facing label for this stream for the meeting (e.g. <c>Speaker 1</c>) when Entra name unknown.</summary>
+    public string StableSpeakerLabel { get; set; } = "";
+
     /// <summary>True when Graph has confirmed <see cref="EntraOid"/> (or equivalent authoritative bind).</summary>
     public bool IsFinal { get; set; }
 }
@@ -57,6 +61,8 @@ public sealed class ParticipantManager
 
     private string _meetingKey = string.Empty;
 
+    private int _speakerCounter;
+
     public ParticipantManager(ILogger<ParticipantManager> logger)
     {
         _logger = logger;
@@ -69,6 +75,7 @@ public sealed class ParticipantManager
             _meetingKey = string.IsNullOrWhiteSpace(callOrMeetingId) ? Guid.NewGuid().ToString("N") : callOrMeetingId.Trim();
             _participants.Clear();
             _bindings.Clear();
+            Interlocked.Exchange(ref _speakerCounter, 0);
             _logger.LogInformation("ParticipantManager reset for meeting key {MeetingKey}.", _meetingKey);
         }
     }
@@ -77,6 +84,38 @@ public sealed class ParticipantManager
 
     public bool TryGetBinding(uint sourceId, out ParticipantBinding? binding) =>
         _bindings.TryGetValue(sourceId, out binding);
+
+    /// <summary>
+    /// Human-facing transcript label: <b>always</b> prefers Entra/Graph display name when <see cref="ParticipantBinding.EntraOid"/> is set;
+    /// otherwise stable <see cref="ParticipantBinding.StableSpeakerLabel"/> (e.g. Speaker 1). Never returns <c>Speaker ({sourceId})</c>.
+    /// </summary>
+    public string GetTranscriptSpeakerLabel(uint sourceId)
+    {
+        if (!_bindings.TryGetValue(sourceId, out var b))
+        {
+            return string.Empty;
+        }
+
+        if (!string.IsNullOrWhiteSpace(b.EntraOid))
+        {
+            var fromEntra = GetCanonicalDisplayName(b.EntraOid.Trim());
+            if (!string.IsNullOrWhiteSpace(fromEntra))
+            {
+                return fromEntra;
+            }
+
+            if (!string.IsNullOrWhiteSpace(b.DisplayName))
+            {
+                return b.DisplayName.Trim();
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(b.DisplayName))
+        {
+            return b.DisplayName.Trim();
+        }
+
+        return string.IsNullOrWhiteSpace(b.StableSpeakerLabel) ? string.Empty : b.StableSpeakerLabel.Trim();
+    }
 
     /// <summary>Entra OID for ALB/SignalR: confirmed OID, else hint, else stable stream id string.</summary>
     public string GetEntraOidForTranscript(uint sourceId)
@@ -154,7 +193,7 @@ public sealed class ParticipantManager
     /// </summary>
     public string? TryBindAudioSource(uint sourceId, string? participantIdOrEntraFromGraph, string displayName, string reason)
     {
-        displayName = string.IsNullOrWhiteSpace(displayName) ? $"Speaker ({sourceId})" : displayName.Trim();
+        var inputDisplayName = string.IsNullOrWhiteSpace(displayName) ? string.Empty : displayName.Trim();
         var graphOrAuthoritative =
             string.Equals(reason, "Graph", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(reason, "RosterMediaStreamsMap", StringComparison.OrdinalIgnoreCase);
@@ -177,13 +216,13 @@ public sealed class ParticipantManager
                     if (!string.IsNullOrWhiteSpace(incomingOid))
                     {
                         existing.EntraOid = incomingOid;
-                        RegisterParticipant(incomingOid, displayName, DateTime.UtcNow);
+                        RegisterParticipant(incomingOid, string.IsNullOrWhiteSpace(inputDisplayName) ? incomingOid : inputDisplayName, DateTime.UtcNow);
                         existing.IsFinal = true;
                     }
 
-                    if (!string.IsNullOrWhiteSpace(displayName))
+                    if (!string.IsNullOrWhiteSpace(inputDisplayName))
                     {
-                        existing.DisplayName = displayName;
+                        existing.DisplayName = inputDisplayName;
                     }
 
                     _logger.LogInformation(
@@ -207,24 +246,10 @@ public sealed class ParticipantManager
                     return null;
                 }
 
-                if (string.IsNullOrWhiteSpace(existing.DisplayName) && !string.IsNullOrWhiteSpace(displayName))
+                if (string.IsNullOrWhiteSpace(existing.DisplayName) && !string.IsNullOrWhiteSpace(inputDisplayName))
                 {
-                    existing.DisplayName = displayName;
+                    existing.DisplayName = inputDisplayName;
                 }
-                return null;
-            }
-
-            if (!existing.IsFinal &&
-                (string.Equals(reason, "JoinOrderDisplayFallback", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(reason, "JoinOrderDisplayFallbackMixed", StringComparison.OrdinalIgnoreCase)))
-            {
-                if (!string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph))
-                {
-                    existing.EntraOid = participantIdOrEntraFromGraph.Trim();
-                }
-
-                existing.DisplayName = displayName;
-                _logger.LogDebug("Join-order hint applied to existing non-final binding for sourceId {SourceId}.", sourceId);
                 return null;
             }
 
@@ -238,11 +263,12 @@ public sealed class ParticipantManager
 
         // First bind only — hard block reassignment is implicit (key did not exist).
         var streamPid = SyntheticParticipantId(sourceId);
+        var stableLabel = $"Speaker {Interlocked.Increment(ref _speakerCounter)}";
         var binding = new ParticipantBinding
         {
             SourceId = sourceId,
             StreamParticipantId = streamPid,
-            DisplayName = displayName
+            StableSpeakerLabel = stableLabel
         };
 
         var initialGraphOid = string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph)
@@ -251,22 +277,14 @@ public sealed class ParticipantManager
         if (graphOrAuthoritative && !string.IsNullOrWhiteSpace(initialGraphOid))
         {
             binding.EntraOid = initialGraphOid;
-            RegisterParticipant(binding.EntraOid, displayName, DateTime.UtcNow);
+            binding.DisplayName = !string.IsNullOrWhiteSpace(inputDisplayName) ? inputDisplayName : stableLabel;
+            RegisterParticipant(binding.EntraOid, binding.DisplayName, DateTime.UtcNow);
             binding.IsFinal = true;
-        }
-        else if (string.Equals(reason, "JoinOrderDisplayFallback", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(reason, "JoinOrderDisplayFallbackMixed", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!string.IsNullOrWhiteSpace(participantIdOrEntraFromGraph))
-            {
-                binding.EntraOid = participantIdOrEntraFromGraph.Trim();
-            }
-
-            binding.IsFinal = false;
         }
         else
         {
             binding.IsFinal = false;
+            binding.DisplayName = stableLabel;
         }
 
         RegisterParticipant(streamPid, binding.DisplayName, DateTime.UtcNow);
@@ -293,7 +311,12 @@ public sealed class ParticipantManager
         }
 
         participantId = b.StreamParticipantId;
-        displayName = string.IsNullOrWhiteSpace(b.DisplayName) ? participantId : b.DisplayName;
+        displayName = GetTranscriptSpeakerLabel(sourceId);
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            displayName = string.IsNullOrWhiteSpace(b.StableSpeakerLabel) ? participantId : b.StableSpeakerLabel;
+        }
+
         return true;
     }
 
@@ -305,11 +328,13 @@ public sealed class ParticipantManager
         }
 
         var p = participantId.Trim();
-        if (TryParseSourceIdFromSynthetic(p, out var sid) &&
-            _bindings.TryGetValue(sid, out var b) &&
-            !string.IsNullOrWhiteSpace(b.DisplayName))
+        if (TryParseSourceIdFromSynthetic(p, out var sid))
         {
-            return b.DisplayName;
+            var label = GetTranscriptSpeakerLabel(sid);
+            if (!string.IsNullOrWhiteSpace(label))
+            {
+                return label;
+            }
         }
 
         return _participants.TryGetValue(p, out var info) ? info.DisplayName : null;
@@ -331,15 +356,5 @@ public sealed class ParticipantManager
         }
 
         return set;
-    }
-
-    public void SetJoinOrderEntraHint(uint sourceId, string entraObjectId)
-    {
-        if (string.IsNullOrWhiteSpace(entraObjectId) || !_bindings.TryGetValue(sourceId, out var b) || b.IsFinal)
-        {
-            return;
-        }
-
-        b.EntraOid = entraObjectId.Trim();
     }
 }

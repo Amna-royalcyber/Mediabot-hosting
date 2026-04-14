@@ -56,13 +56,10 @@ public sealed class TranscriptIdentityResolver
                 ? binding.EntraOid.Trim()
                 : ParticipantManager.SyntheticParticipantId(sourceId);
 
-            var name = string.IsNullOrWhiteSpace(binding.DisplayName)
-                ? dn
-                : binding.DisplayName.Trim();
-
-            if (!string.IsNullOrWhiteSpace(binding.EntraOid))
+            var name = _participantManager.GetTranscriptSpeakerLabel(sourceId);
+            if (string.IsNullOrWhiteSpace(name))
             {
-                name = _participantManager.GetCanonicalDisplayName(binding.EntraOid.Trim()) ?? name;
+                name = dn;
             }
 
             return (uid, name);

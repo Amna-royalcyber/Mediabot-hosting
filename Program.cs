@@ -63,8 +63,7 @@ public static class Program
             TranscribeAudioChunkMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIBE_CHUNK_MS", "Bot:TranscribeAudioChunkMilliseconds", 100),
             TranscribePartialMinIntervalMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIBE_PARTIAL_MS", "Bot:TranscribePartialMinIntervalMilliseconds", 90),
             TranscriptTimelineMergeMilliseconds = ReadInt(builder.Configuration, "BOT_TRANSCRIPT_TIMELINE_MS", "Bot:TranscriptTimelineMergeMilliseconds", 20),
-            TranscriptAlbEndpoint = ReadOptional(builder.Configuration, "BOT_TRANSCRIPT_ALB_ENDPOINT", "Bot:TranscriptAlbEndpoint"),
-            MsiToRosterJoinOrderFallback = ReadBool(builder.Configuration, "BOT_MSI_ROSTER_JOIN_ORDER_FALLBACK", "Bot:MsiToRosterJoinOrderFallback", defaultValue: true)
+            TranscriptAlbEndpoint = ReadOptional(builder.Configuration, "BOT_TRANSCRIPT_ALB_ENDPOINT", "Bot:TranscriptAlbEndpoint")
         });
 
         builder.Services.AddHttpClient("AlbTranscriptSender", client =>

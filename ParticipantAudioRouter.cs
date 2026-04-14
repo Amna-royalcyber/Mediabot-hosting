@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Linq;
@@ -15,11 +16,7 @@ public sealed class ParticipantAudioRouter
     private readonly AwsTranscribeService _awsTranscribeService;
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ParticipantManager _participantManager;
-    private readonly BotSettings _settings;
     private readonly ILogger<ParticipantAudioRouter> _logger;
-
-    /// <summary>Distinct MSIs seen while Graph omitted mediaStreams; paired to <see cref="MeetingParticipantService"/> roster order.</summary>
-    private readonly List<uint> _joinOrderFallbackSourceIds = new();
 
     /// <summary>Teams media source id for the current dominant speaker (from <see cref="IAudioSocket.DominantSpeakerChanged"/>).</summary>
     private uint _dominantSourceId = (uint)DominantSpeakerChangedEventArgs.None;
@@ -36,21 +33,23 @@ public sealed class ParticipantAudioRouter
     private readonly object _inferLock = new();
 
     private readonly ConcurrentDictionary<uint, byte> _warnedUnmappedSourceIds = new();
-    private readonly ConcurrentDictionary<uint, byte> _activeSourceIds = new();
+
+    /// <summary>Last time we saw PCM for this MSI (unmixed chunk or dominant-speaker event). Used for mixed-mode “recent speakers” only.</summary>
+    private readonly ConcurrentDictionary<uint, DateTime> _lastSeenAudio = new();
+
+    private static readonly TimeSpan RecentSpeakerWindow = TimeSpan.FromSeconds(2);
 
     public ParticipantAudioRouter(
         AudioProcessor audioProcessor,
         AwsTranscribeService awsTranscribeService,
         MeetingParticipantService meetingParticipants,
         ParticipantManager participantManager,
-        BotSettings settings,
         ILogger<ParticipantAudioRouter> logger)
     {
         _audioProcessor = audioProcessor;
         _awsTranscribeService = awsTranscribeService;
         _meetingParticipants = meetingParticipants;
         _participantManager = participantManager;
-        _settings = settings;
         _logger = logger;
     }
 
@@ -60,15 +59,10 @@ public sealed class ParticipantAudioRouter
         _botClientId = botClientId ?? string.Empty;
         var none = (uint)DominantSpeakerChangedEventArgs.None;
         _dominantSourceId = none;
-        _activeSourceIds.Clear();
+        _lastSeenAudio.Clear();
         lock (_rescanLock)
         {
             _lastParticipantRescanUtc = DateTime.MinValue;
-        }
-
-        lock (_inferLock)
-        {
-            _joinOrderFallbackSourceIds.Clear();
         }
 
         var bot = _botClientId;
@@ -121,19 +115,19 @@ public sealed class ParticipantAudioRouter
 
         foreach (var ub in unmixed)
         {
-            var sourceId = Convert.ToUInt32(ub.ActiveSpeakerId);
+            var sourceId = ResolveUnmixedStreamSourceId(ub);
             if (sourceId == (uint)DominantSpeakerChangedEventArgs.None)
             {
                 continue;
             }
-            _activeSourceIds[sourceId] = 0;
+
+            _lastSeenAudio[sourceId] = DateTime.UtcNow;
 
             if (!_participantManager.TryResolveAudioSource(sourceId, out var participantId, out var displayName))
             {
                 if (!TryApplyRosterMediaStreamMap(sourceId, out participantId, out displayName))
                 {
-                    var roster = _meetingParticipants.GetRosterSnapshot();
-                    if (!TryInferBindingForUnmappedSource(sourceId, roster, out participantId, out displayName))
+                    if (!TryInferBindingForUnmappedSource(sourceId, out participantId, out displayName))
                     {
                         LogUnmappedSourceIdOnce(sourceId);
                         continue;
@@ -155,6 +149,12 @@ public sealed class ParticipantAudioRouter
 
             if (pcm.Length == 0)
             {
+                continue;
+            }
+
+            if (IsShortUtterancePcm(pcm))
+            {
+                _logger.LogDebug("Skipping low-confidence short utterance for source {SourceId} ({Bytes} bytes PCM).", sourceId, pcm.Length);
                 continue;
             }
 
@@ -229,7 +229,7 @@ public sealed class ParticipantAudioRouter
         _dominantSourceId = sourceId;
         if (sourceId != (uint)DominantSpeakerChangedEventArgs.None)
         {
-            _activeSourceIds[sourceId] = 0;
+            _lastSeenAudio[sourceId] = DateTime.UtcNow;
         }
     }
 
@@ -290,46 +290,11 @@ public sealed class ParticipantAudioRouter
     }
 
     /// <summary>
-    /// Maps the Nth distinct MSI (first-seen order) to the Nth human in roster ingest order. Caller must hold <see cref="_inferLock"/>.
-    /// </summary>
-    private bool TryAllocateJoinOrderRosterNoLock(uint sourceId, IReadOnlyList<RosterParticipantDto> roster, out string participantId, out string displayName)
-    {
-        participantId = string.Empty;
-        displayName = string.Empty;
-        if (!_settings.MsiToRosterJoinOrderFallback || roster.Count == 0)
-        {
-            return false;
-        }
-
-        var idx = _joinOrderFallbackSourceIds.IndexOf(sourceId);
-        if (idx < 0)
-        {
-            _joinOrderFallbackSourceIds.Add(sourceId);
-            idx = _joinOrderFallbackSourceIds.Count - 1;
-            if (idx == 0)
-            {
-                _logger.LogWarning(
-                    "Graph did not provide mediaStreams source ids; using join-order fallback (Nth new MSI → Nth roster participant by ingest order). " +
-                    "Entra display names are real; speaker↔name alignment is best-effort. Disable with Bot:MsiToRosterJoinOrderFallback=false.");
-            }
-        }
-
-        var rIdx = Math.Min(idx, roster.Count - 1);
-        var p = roster[rIdx];
-        participantId = p.AzureAdObjectId;
-        displayName = string.IsNullOrWhiteSpace(p.DisplayName) ? participantId : p.DisplayName.Trim();
-        _participantManager.SetJoinOrderEntraHint(sourceId, p.AzureAdObjectId);
-        return true;
-    }
-
-    /// <summary>
-    /// When Graph omits <c>mediaStreams[].sourceId</c> for a stream, we never map that MSI to a roster user by headcount
-    /// (e.g. "only one person in roster") — that mis-assigns the first packets before others join. Use a per-source placeholder;
-    /// <see cref="ParticipantManager.TryBindAudioSource"/> upgrades to Entra when Graph sends mediaStreams.
+    /// When Graph has not yet correlated <c>mediaStreams[].sourceId</c> to a user, create a per-MSI placeholder only.
+    /// Entra identity is applied later via Graph/roster — never via roster join order.
     /// </summary>
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
-        IReadOnlyList<RosterParticipantDto> roster,
         out string participantId,
         out string displayName)
     {
@@ -342,27 +307,13 @@ public sealed class ParticipantAudioRouter
                 return true;
             }
 
-            if (roster.Count == 0)
-            {
-                return false;
-            }
-
-            if (_settings.MsiToRosterJoinOrderFallback &&
-                TryAllocateJoinOrderRosterNoLock(sourceId, roster, out var fjPid, out var fjDn))
-            {
-                _participantManager.TryBindAudioSource(sourceId, fjPid, fjDn, "JoinOrderDisplayFallback");
-                _awsTranscribeService.UpsertParticipant(fjPid, fjDn);
-                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
-            }
-
-            var syntheticName = $"Speaker ({sourceId})";
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
             {
                 _logger.LogInformation(
-                    "Graph has not mapped mediaStreams for some streams yet; using per-source placeholders until Entra mappings arrive (set Bot:MsiToRosterJoinOrderFallback=true for Entra names by join order).");
+                    "Graph has not mapped mediaStreams for some streams yet; using per-MSI placeholders until Graph provides sourceId → user (no roster-order guessing).");
             }
 
-            _participantManager.TryBindAudioSource(sourceId, null, syntheticName, "SyntheticUntilGraph");
+            _participantManager.TryBindAudioSource(sourceId, null, string.Empty, "SyntheticUntilGraph");
             return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
         }
     }
@@ -416,7 +367,7 @@ public sealed class ParticipantAudioRouter
             return true;
         }
 
-        _participantManager.TryBindAudioSource(onlySourceId, null, $"Speaker ({onlySourceId})", "SyntheticDominantMixed");
+        _participantManager.TryBindAudioSource(onlySourceId, null, string.Empty, "SyntheticDominantMixed");
         if (_participantManager.TryResolveAudioSource(onlySourceId, out _, out displayName))
         {
             sourceStreamId = onlySourceId;
@@ -428,14 +379,49 @@ public sealed class ParticipantAudioRouter
 
     private List<uint> GetActiveSourceIds()
     {
-        var ids = _activeSourceIds.Keys.ToList();
-        var dom = _dominantSourceId;
-        if (dom != (uint)DominantSpeakerChangedEventArgs.None && !ids.Contains(dom))
-        {
-            ids.Add(dom);
-        }
-        return ids;
+        var now = DateTime.UtcNow;
+        return _lastSeenAudio
+            .Where(kvp => (now - kvp.Value) <= RecentSpeakerWindow)
+            .Select(kvp => kvp.Key)
+            .ToList();
     }
+
+    /// <summary>
+    /// Prefer a dedicated stream/source id when the SDK exposes it; otherwise fall back to <see cref="UnmixedAudioBuffer.ActiveSpeakerId"/> (dominant).
+    /// </summary>
+    private static uint ResolveUnmixedStreamSourceId(UnmixedAudioBuffer ub)
+    {
+        var none = (uint)DominantSpeakerChangedEventArgs.None;
+        try
+        {
+            foreach (var propName in new[] { "SourceId", "StreamSourceId", "MediaSourceId" })
+            {
+                var p = ub.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+                if (p is null)
+                {
+                    continue;
+                }
+
+                var val = p.GetValue(ub);
+                switch (val)
+                {
+                    case uint u when u != 0 && u != none:
+                        return u;
+                    case int i when i > 0:
+                        return (uint)i;
+                }
+            }
+        }
+        catch
+        {
+            // fall through to ActiveSpeakerId
+        }
+
+        return Convert.ToUInt32(ub.ActiveSpeakerId);
+    }
+
+    /// <summary>~300 ms at 16 kHz mono PCM16 (conservative filter for coughs/clicks).</summary>
+    private static bool IsShortUtterancePcm(byte[] pcm) => pcm.Length < 9600;
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
     {

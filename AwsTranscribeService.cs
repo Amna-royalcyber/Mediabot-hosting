@@ -350,10 +350,11 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 if (sourceForFragment is uint sid)
                 {
                     userIdForBroadcast = ParticipantManager.SyntheticParticipantId(sid);
-                    displayName = _participantManager.GetCanonicalDisplayName(userIdForBroadcast) ??
-                                  (_participantManager.TryGetBinding(sid, out var b) && b is not null
-                                      ? b.DisplayName
-                                      : _mixedDisplayName);
+                    displayName = _participantManager.GetTranscriptSpeakerLabel(sid);
+                    if (string.IsNullOrWhiteSpace(displayName))
+                    {
+                        displayName = _mixedDisplayName;
+                    }
                 }
                 else if (_fixedSourceStreamId is null && _mixedFallbackUserId is not null)
                 {

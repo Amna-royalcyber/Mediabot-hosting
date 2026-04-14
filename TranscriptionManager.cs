@@ -14,6 +14,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
     private readonly BotSettings _settings;
     private readonly TranscriptAggregator _aggregator;
     private readonly MeetingParticipantService _meetingParticipants;
+    private readonly ParticipantManager _participantManager;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TranscriptionManager> _logger;
     private readonly ConcurrentDictionary<uint, TranscribeStreamService> _streamsBySourceId = new();
@@ -26,12 +27,14 @@ public sealed class TranscriptionManager : IAsyncDisposable
         BotSettings settings,
         TranscriptAggregator aggregator,
         MeetingParticipantService meetingParticipants,
+        ParticipantManager participantManager,
         ILoggerFactory loggerFactory,
         ILogger<TranscriptionManager> logger)
     {
         _settings = settings;
         _aggregator = aggregator;
         _meetingParticipants = meetingParticipants;
+        _participantManager = participantManager;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -70,7 +73,13 @@ public sealed class TranscriptionManager : IAsyncDisposable
         if (!_participantBySourceId.TryGetValue(sourceId, out var participant))
         {
             var syntheticId = ParticipantManager.SyntheticParticipantId(sourceId);
-            var syn = new ParticipantIdentity(syntheticId, $"Speaker ({sourceId})");
+            var label = _participantManager.GetTranscriptSpeakerLabel(sourceId);
+            if (string.IsNullOrWhiteSpace(label))
+            {
+                label = "Unknown";
+            }
+
+            var syn = new ParticipantIdentity(syntheticId, label);
             if (_participantBySourceId.TryAdd(sourceId, syn))
             {
                 participant = syn;
