@@ -52,15 +52,25 @@ public sealed class TranscriptAggregator : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
         while (!stoppingToken.IsCancellationRequested)
         {
-            var next = await _incoming.Reader.ReadAsync(stoppingToken);
-            lock (_lock)
+            var waitReadTask = _incoming.Reader.WaitToReadAsync(stoppingToken).AsTask();
+            var tickTask = timer.WaitForNextTickAsync(stoppingToken).AsTask();
+            var completed = await Task.WhenAny(waitReadTask, tickTask);
+            if (completed == waitReadTask && await waitReadTask)
             {
-                _timeline.Enqueue(next, next.AudioTimestamp);
+                while (_incoming.Reader.TryRead(out var next))
+                {
+                    lock (_lock)
+                    {
+                        _timeline.Enqueue(next, next.AudioTimestamp);
+                    }
+                }
+
+                await DrainAsync(stoppingToken);
             }
 
-            await DrainAsync(stoppingToken);
             await FlushResolvedBufferedAsync();
         }
     }
@@ -103,6 +113,14 @@ public sealed class TranscriptAggregator : BackgroundService
                 (!_participantManager.TryGetBinding(sid, out var binding) || binding is null || binding.State != IdentityState.Resolved))
             {
                 _buffer.Buffer(item);
+                await _broadcaster.BroadcastAsync(
+                    item.Kind,
+                    item.Text,
+                    item.EmittedAtUtc,
+                    item.AudioTimestamp,
+                    speakerLabel: $"Unresolved Speaker ({sid})",
+                    azureAdObjectId: ParticipantManager.SyntheticParticipantId(sid),
+                    sourceStreamId: sid);
                 return;
             }
         }
@@ -116,9 +134,17 @@ public sealed class TranscriptAggregator : BackgroundService
             (resolvedUserId.StartsWith(ParticipantManager.SyntheticIdPrefix, StringComparison.OrdinalIgnoreCase) ||
              resolvedDisplayName.StartsWith("Unresolved Speaker", StringComparison.OrdinalIgnoreCase)))
         {
-            if (item.SourceStreamId is not null)
+            if (item.SourceStreamId is uint sid)
             {
                 _buffer.Buffer(item);
+                await _broadcaster.BroadcastAsync(
+                    item.Kind,
+                    item.Text,
+                    item.EmittedAtUtc,
+                    item.AudioTimestamp,
+                    speakerLabel: $"Unresolved Speaker ({sid})",
+                    azureAdObjectId: ParticipantManager.SyntheticParticipantId(sid),
+                    sourceStreamId: sid);
             }
             return;
         }
@@ -136,6 +162,15 @@ public sealed class TranscriptAggregator : BackgroundService
     private async Task FlushResolvedBufferedAsync()
     {
         var flushed = _buffer.DrainResolved(_participantManager);
+        foreach (var item in flushed.OrderBy(f => f.AudioTimestamp))
+        {
+            await HandleFragmentAsync(item);
+        }
+    }
+
+    public async Task ResolvePending(uint sourceId, string? _displayName = null)
+    {
+        var flushed = _buffer.ResolvePending(sourceId, _participantManager);
         foreach (var item in flushed.OrderBy(f => f.AudioTimestamp))
         {
             await HandleFragmentAsync(item);

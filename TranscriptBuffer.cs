@@ -39,4 +39,23 @@ public sealed class TranscriptBuffer
 
         return flushed;
     }
+
+    public IReadOnlyList<TranscriptFragment> ResolvePending(uint sourceId, IParticipantManager participantManager)
+    {
+        var flushed = new List<TranscriptFragment>();
+        if (!participantManager.TryGetBinding(sourceId, out var binding) || binding is null || binding.State != IdentityState.Resolved)
+        {
+            return flushed;
+        }
+
+        if (_pendingBySource.TryRemove(sourceId, out var queue))
+        {
+            while (queue.TryDequeue(out var item))
+            {
+                flushed.Add(item);
+            }
+        }
+
+        return flushed;
+    }
 }
