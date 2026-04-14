@@ -52,11 +52,10 @@ public sealed class TranscriptIdentityResolver
 
         if (_participantManager.TryResolveUserFromAudioStream(sourceId, out var mappedUserId))
         {
-            var speakerId = _participantManager.TryGetSpeakerIdForUser(mappedUserId);
             var canonicalName = _participantManager.GetCanonicalDisplayName(mappedUserId);
             var resolvedName = !string.IsNullOrWhiteSpace(canonicalName)
                 ? canonicalName
-                : (!string.IsNullOrWhiteSpace(speakerId) ? speakerId : (string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn));
+                : (string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn);
             return (mappedUserId, resolvedName);
         }
 
@@ -71,7 +70,7 @@ public sealed class TranscriptIdentityResolver
                 _participantManager.TryGetBinding(sourceId, out binding);
                 if (binding is null)
                 {
-                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn);
+                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn);
                 }
             }
 
@@ -82,7 +81,7 @@ public sealed class TranscriptIdentityResolver
             var name = _participantManager.GetTranscriptSpeakerLabel(sourceId);
             if (string.IsNullOrWhiteSpace(name))
             {
-                name = string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn;
+                name = string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn;
             }
 
             return (uid, name);
@@ -90,18 +89,14 @@ public sealed class TranscriptIdentityResolver
 
         if (_meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var entraOid, out var rosterName))
         {
-            var speakerId = _participantManager.TryGetSpeakerIdForUser(entraOid);
-            if (string.IsNullOrWhiteSpace(rosterName) && !string.IsNullOrWhiteSpace(speakerId))
-            {
-                rosterName = speakerId;
-            }
+            _participantManager.TryBindAudioSource(sourceId, entraOid, rosterName, "RosterMediaStreamsMap");
             return (entraOid, rosterName);
         }
 
         var fallbackName = _participantManager.GetCanonicalDisplayName(ParticipantManager.SyntheticParticipantId(sourceId));
         if (string.IsNullOrWhiteSpace(fallbackName))
         {
-            fallbackName = string.IsNullOrWhiteSpace(dn) ? "Unknown Speaker" : dn;
+            fallbackName = string.IsNullOrWhiteSpace(dn) ? $"Unresolved Speaker ({sourceId})" : dn;
         }
         return (ParticipantManager.SyntheticParticipantId(sourceId), fallbackName);
     }

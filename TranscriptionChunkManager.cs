@@ -16,6 +16,7 @@ public sealed class TranscriptItem
 
     public required string ParticipantName { get; init; }
     public required string Text { get; init; }
+    public uint? SourceStreamId { get; init; }
 }
 
 public sealed class TranscriptionChunk
@@ -168,7 +169,8 @@ public sealed class TranscriptionChunkManager : BackgroundService
                 Timestamp = utc,
                 EntraObjectId = entraForAlb,
                 ParticipantName = speakerName.Trim(),
-                Text = text.Trim()
+                Text = text.Trim(),
+                SourceStreamId = sourceStreamId
             });
         }
 
@@ -250,9 +252,19 @@ public sealed class TranscriptionChunkManager : BackgroundService
                 continue;
             }
 
+            var resolvedName = fragment.ParticipantName;
+            if (fragment.SourceStreamId is uint sid)
+            {
+                var latestName = _participantManager.GetTranscriptSpeakerLabel(sid);
+                if (!string.IsNullOrWhiteSpace(latestName))
+                {
+                    resolvedName = latestName;
+                }
+            }
+
             transcriptList.Add(new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                [fragment.ParticipantName] = fragment.Text.Trim()
+                [resolvedName] = fragment.Text.Trim()
             });
         }
 

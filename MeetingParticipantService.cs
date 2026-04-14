@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Graph.Communications.Calls;
 using Microsoft.Graph.Communications.Resources;
@@ -263,11 +264,15 @@ public sealed class MeetingParticipantService
             var keys = resource.AdditionalData is null
                 ? "<none>"
                 : string.Join(", ", resource.AdditionalData.Keys);
+            var anonymized = ReadAdditionalDataBool(resource.AdditionalData, "isIdentityAnonymized");
+            var voiceConsent = ReadAdditionalDataString(resource.AdditionalData, "aiVoiceConsent");
             _logger.LogInformation(
-                "Participant update has no sourceId yet for {DisplayName} ({AzureAdObjectId}). AdditionalData keys: {Keys}",
+                "Participant update has no sourceId yet for {DisplayName} ({AzureAdObjectId}). AdditionalData keys: {Keys}; isIdentityAnonymized={IsIdentityAnonymized}; aiVoiceConsent={AiVoiceConsent}",
                 displayName ?? azureUserId,
                 azureUserId,
-                keys);
+                keys,
+                anonymized.HasValue ? anonymized.Value.ToString() : "<missing>",
+                string.IsNullOrWhiteSpace(voiceConsent) ? "<missing>" : voiceConsent);
         }
 
         _ = PublishRosterAsync();
@@ -372,6 +377,91 @@ public sealed class MeetingParticipantService
         var appId = resource.Info?.Identity?.Application?.Id;
         return !string.IsNullOrEmpty(appId) &&
                string.Equals(appId.Trim(), botClientId.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool? ReadAdditionalDataBool(IDictionary<string, object>? additionalData, string key)
+    {
+        if (additionalData is null)
+        {
+            return null;
+        }
+
+        foreach (var kv in additionalData)
+        {
+            if (!string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var value = kv.Value;
+            if (value is null)
+            {
+                return null;
+            }
+
+            if (value is bool b)
+            {
+                return b;
+            }
+
+            if (value is JsonElement je)
+            {
+                if (je.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                {
+                    return je.GetBoolean();
+                }
+
+                if (je.ValueKind == JsonValueKind.String && bool.TryParse(je.GetString(), out var jb))
+                {
+                    return jb;
+                }
+            }
+
+            if (bool.TryParse(Convert.ToString(value), out var parsed))
+            {
+                return parsed;
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string? ReadAdditionalDataString(IDictionary<string, object>? additionalData, string key)
+    {
+        if (additionalData is null)
+        {
+            return null;
+        }
+
+        foreach (var kv in additionalData)
+        {
+            if (!string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var value = kv.Value;
+            if (value is null)
+            {
+                return null;
+            }
+
+            if (value is JsonElement je)
+            {
+                if (je.ValueKind == JsonValueKind.String)
+                {
+                    return je.GetString();
+                }
+
+                return je.GetRawText();
+            }
+
+            return Convert.ToString(value);
+        }
+
+        return null;
     }
 
     private readonly record struct RosterEntry(
