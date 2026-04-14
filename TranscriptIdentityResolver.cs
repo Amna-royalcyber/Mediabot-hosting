@@ -52,6 +52,15 @@ public sealed class TranscriptIdentityResolver
 
         if (_participantManager.TryGetBinding(sourceId, out var binding) && binding is not null)
         {
+            // Late Graph/mediaStreams backfill: if we already have a placeholder binding, upgrade it
+            // from MeetingParticipantService's sourceId->Entra correlation when available.
+            if (string.IsNullOrWhiteSpace(binding.EntraOid) &&
+                _meetingParticipants.TryResolveAudioSourceToEntra(sourceId, out var lateOid, out var lateName))
+            {
+                _participantManager.TryBindAudioSource(sourceId, lateOid, lateName, "RosterMediaStreamsMap");
+                _participantManager.TryGetBinding(sourceId, out binding);
+            }
+
             var uid = !string.IsNullOrWhiteSpace(binding.EntraOid)
                 ? binding.EntraOid.Trim()
                 : ParticipantManager.SyntheticParticipantId(sourceId);

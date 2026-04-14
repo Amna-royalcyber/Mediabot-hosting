@@ -33,11 +33,12 @@ public sealed class TranscriptBroadcaster
         string? azureAdObjectId = null,
         uint? sourceStreamId = null)
     {
-        var resolvedEntraForClients = sourceStreamId is uint sid
-            ? _participantManager.GetEntraOidForTranscript(sid)
-            : (string.IsNullOrWhiteSpace(azureAdObjectId)
-                ? azureAdObjectId
-                : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId));
+        var resolvedFromResolver = string.IsNullOrWhiteSpace(azureAdObjectId)
+            ? null
+            : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId);
+        var resolvedEntraForClients = !string.IsNullOrWhiteSpace(resolvedFromResolver)
+            ? resolvedFromResolver
+            : (sourceStreamId is uint sid ? _participantManager.GetEntraOidForTranscript(sid) : null);
         var entraForClients = !string.IsNullOrWhiteSpace(resolvedEntraForClients) &&
                               (ParticipantManager.IsSyntheticParticipantId(resolvedEntraForClients) ||
                                string.Equals(resolvedEntraForClients, AwsTranscribeService.UnknownMixedUserId, StringComparison.OrdinalIgnoreCase))
@@ -74,7 +75,9 @@ public sealed class TranscriptBroadcaster
         {
             await _chunkManager.RecordFinalAsync(
                 utteranceUtc,
-                sourceStreamId is uint sourceSid ? _participantManager.GetEntraOidForTranscript(sourceSid) : (azureAdObjectId ?? string.Empty),
+                !string.IsNullOrWhiteSpace(resolvedEntraForClients)
+                    ? resolvedEntraForClients
+                    : (sourceStreamId is uint sourceSid ? _participantManager.GetEntraOidForTranscript(sourceSid) : (azureAdObjectId ?? string.Empty)),
                 speakerLabel,
                 text,
                 dedupeKey,
