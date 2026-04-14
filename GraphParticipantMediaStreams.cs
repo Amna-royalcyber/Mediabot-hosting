@@ -41,7 +41,7 @@ internal static class GraphParticipantMediaStreams
             AddSourceIdsFromJsonElement(je, list);
             if (list.Count > 0)
             {
-                return list;
+                return list.Distinct().ToList();
             }
 
             // Sometimes the element stringifies to a JSON array Teams sent with PascalCase keys.
@@ -54,7 +54,14 @@ internal static class GraphParticipantMediaStreams
                 }
             }
 
-            return list;
+            if (list.Count > 0)
+            {
+                return list.Distinct().ToList();
+            }
+
+            // Ultimate fallback: recursively search all AdditionalData for keys named sourceId.
+            ScanAdditionalDataForSourceIds(participant.AdditionalData, list);
+            return list.Distinct().ToList();
         }
 
         if (msObj is string str && TryParseFromJson(str, list))
@@ -72,7 +79,12 @@ internal static class GraphParticipantMediaStreams
             }
         }
 
-        return list;
+        if (list.Count == 0)
+        {
+            ScanAdditionalDataForSourceIds(participant.AdditionalData, list);
+        }
+
+        return list.Distinct().ToList();
     }
 
     private static void AddSourceIdsFromJsonElement(JsonElement je, List<uint> list)
@@ -158,6 +170,149 @@ internal static class GraphParticipantMediaStreams
         catch
         {
             return false;
+        }
+    }
+
+    private static void ScanAdditionalDataForSourceIds(IDictionary<string, object> data, List<uint> list)
+    {
+        foreach (var kv in data)
+        {
+            if (string.Equals(kv.Key, "sourceId", StringComparison.OrdinalIgnoreCase))
+            {
+                TryAddSourceIdFromUnknownValue(kv.Value, list);
+            }
+
+            ScanUnknownForSourceIds(kv.Value, list);
+        }
+    }
+
+    private static void ScanUnknownForSourceIds(object? value, List<uint> list)
+    {
+        if (value is null)
+        {
+            return;
+        }
+
+        if (value is JsonDocument jd)
+        {
+            ScanJsonElementForSourceIds(jd.RootElement, list);
+            return;
+        }
+
+        if (value is JsonElement je)
+        {
+            ScanJsonElementForSourceIds(je, list);
+            return;
+        }
+
+        if (value is IDictionary<string, object> dict)
+        {
+            ScanAdditionalDataForSourceIds(dict, list);
+            return;
+        }
+
+        if (value is IEnumerable<object> enumerable)
+        {
+            foreach (var item in enumerable)
+            {
+                ScanUnknownForSourceIds(item, list);
+            }
+
+            return;
+        }
+
+        if (value is string s)
+        {
+            var t = s.Trim();
+            if (t.Length > 0 && (t[0] == '[' || t[0] == '{'))
+            {
+                TryParseFromJson(t, list);
+            }
+        }
+    }
+
+    private static void ScanJsonElementForSourceIds(JsonElement element, List<uint> list)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var prop in element.EnumerateObject())
+                {
+                    if (string.Equals(prop.Name, "sourceId", StringComparison.OrdinalIgnoreCase))
+                    {
+                        TryAddSourceIdFromJsonValue(prop.Value, list);
+                    }
+
+                    ScanJsonElementForSourceIds(prop.Value, list);
+                }
+
+                return;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    ScanJsonElementForSourceIds(item, list);
+                }
+
+                return;
+            case JsonValueKind.String:
+                var raw = element.GetString();
+                if (!string.IsNullOrWhiteSpace(raw))
+                {
+                    var t = raw.Trim();
+                    if (t.Length > 0 && (t[0] == '[' || t[0] == '{'))
+                    {
+                        TryParseFromJson(t, list);
+                    }
+                }
+
+                return;
+            default:
+                return;
+        }
+    }
+
+    private static void TryAddSourceIdFromUnknownValue(object? value, List<uint> list)
+    {
+        if (value is null)
+        {
+            return;
+        }
+
+        switch (value)
+        {
+            case uint u:
+                list.Add(u);
+                return;
+            case int i when i > 0:
+                list.Add((uint)i);
+                return;
+            case long l when l > 0 && l <= uint.MaxValue:
+                list.Add((uint)l);
+                return;
+            case JsonElement je:
+                TryAddSourceIdFromJsonValue(je, list);
+                return;
+            default:
+                if (uint.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out var parsed))
+                {
+                    list.Add(parsed);
+                }
+
+                return;
+        }
+    }
+
+    private static void TryAddSourceIdFromJsonValue(JsonElement value, List<uint> list)
+    {
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetUInt32(out var n))
+        {
+            list.Add(n);
+            return;
+        }
+
+        if (value.ValueKind == JsonValueKind.String && uint.TryParse(value.GetString(), out var s))
+        {
+            list.Add(s);
         }
     }
 }

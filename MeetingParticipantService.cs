@@ -19,6 +19,7 @@ public sealed class MeetingParticipantService
 
     private readonly TranscriptBroadcaster _broadcaster;
     private readonly EntraUserResolver _entra;
+    private readonly ParticipantManager _participantManager;
     private readonly ILogger<MeetingParticipantService> _logger;
     private readonly object _lock = new();
 
@@ -34,10 +35,12 @@ public sealed class MeetingParticipantService
     public MeetingParticipantService(
         TranscriptBroadcaster broadcaster,
         EntraUserResolver entra,
+        ParticipantManager participantManager,
         ILogger<MeetingParticipantService> logger)
     {
         _broadcaster = broadcaster;
         _entra = entra;
+        _participantManager = participantManager;
         _logger = logger;
     }
 
@@ -241,9 +244,30 @@ public sealed class MeetingParticipantService
             }
         }
 
-        foreach (var sid in GraphParticipantMediaStreams.ExtractSourceIds(resource))
+        // Roster-first identity shell: participant identity exists before any audio/sourceId is seen.
+        _participantManager.RegisterParticipant(azureUserId, displayName ?? azureUserId, DateTime.UtcNow);
+
+        var sourceIds = GraphParticipantMediaStreams.ExtractSourceIds(resource);
+        foreach (var sid in sourceIds)
         {
             _audioSourceIdToAzureObjectId[sid] = azureUserId;
+            _logger.LogInformation(
+                "Authoritative stream map discovered: sourceId {SourceId} -> {DisplayName} ({AzureAdObjectId}).",
+                sid,
+                displayName ?? azureUserId,
+                azureUserId);
+        }
+
+        if (sourceIds.Count == 0)
+        {
+            var keys = resource.AdditionalData is null
+                ? "<none>"
+                : string.Join(", ", resource.AdditionalData.Keys);
+            _logger.LogInformation(
+                "Participant update has no sourceId yet for {DisplayName} ({AzureAdObjectId}). AdditionalData keys: {Keys}",
+                displayName ?? azureUserId,
+                azureUserId,
+                keys);
         }
 
         _ = PublishRosterAsync();

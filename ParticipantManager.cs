@@ -204,7 +204,7 @@ public sealed class ParticipantManager
 
         displayName = string.IsNullOrWhiteSpace(displayName) ? participantId.Trim() : displayName.Trim();
         var pid = participantId.Trim();
-        GetOrCreateSpeakerIdForUser(pid);
+        var speakerId = GetOrCreateSpeakerIdForUser(pid);
 
         _participants.AddOrUpdate(
             pid,
@@ -216,6 +216,7 @@ public sealed class ParticipantManager
                 AudioStreamId = null
             },
             (_, existing) => existing);
+        _logger.LogInformation("Roster pre-bind: {DisplayName} ({ParticipantId}) assigned {SpeakerId}.", displayName, pid, speakerId);
     }
 
     /// <summary>
@@ -290,7 +291,7 @@ public sealed class ParticipantManager
 
         // First bind only — hard block reassignment is implicit (key did not exist).
         var streamPid = SyntheticParticipantId(sourceId);
-        var stableLabel = "Unknown Speaker";
+        var stableLabel = $"Unknown Speaker [{sourceId}]";
         var binding = new ParticipantBinding
         {
             SourceId = sourceId,
