@@ -211,29 +211,6 @@ public sealed class ParticipantManager
                     ? null
                     : participantIdOrEntraFromGraph.Trim();
 
-                if (!existing.IsFinal)
-                {
-                    if (!string.IsNullOrWhiteSpace(incomingOid))
-                    {
-                        existing.EntraOid = incomingOid;
-                        RegisterParticipant(incomingOid, string.IsNullOrWhiteSpace(inputDisplayName) ? incomingOid : inputDisplayName, DateTime.UtcNow);
-                        existing.IsFinal = true;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(inputDisplayName))
-                    {
-                        existing.DisplayName = inputDisplayName;
-                    }
-
-                    _logger.LogInformation(
-                        "Enriched non-final sourceId {SourceId} from Graph/roster: EntraOid={Entra}, DisplayName={Name} [{Reason}].",
-                        sourceId,
-                        existing.EntraOid,
-                        existing.DisplayName,
-                        reason);
-                    return null;
-                }
-
                 if (!string.IsNullOrWhiteSpace(incomingOid) &&
                     !string.IsNullOrWhiteSpace(existing.EntraOid) &&
                     !string.Equals(existing.EntraOid, incomingOid, StringComparison.OrdinalIgnoreCase))
@@ -246,10 +223,27 @@ public sealed class ParticipantManager
                     return null;
                 }
 
-                if (string.IsNullOrWhiteSpace(existing.DisplayName) && !string.IsNullOrWhiteSpace(inputDisplayName))
+                if (!string.IsNullOrWhiteSpace(incomingOid))
+                {
+                    existing.EntraOid = incomingOid;
+                    existing.IsFinal = true;
+                }
+
+                if (!string.IsNullOrWhiteSpace(inputDisplayName))
                 {
                     existing.DisplayName = inputDisplayName;
                 }
+
+                if (!string.IsNullOrWhiteSpace(existing.EntraOid))
+                {
+                    var resolved = string.IsNullOrWhiteSpace(existing.DisplayName) ? existing.EntraOid : existing.DisplayName;
+                    RegisterParticipant(existing.EntraOid, resolved, DateTime.UtcNow);
+                    _logger.LogInformation(
+                        "Graph mapped sourceId {SourceId} → Entra {DisplayName}",
+                        sourceId,
+                        resolved);
+                }
+
                 return null;
             }
 

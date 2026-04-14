@@ -33,11 +33,16 @@ public sealed class TranscriptBroadcaster
         string? azureAdObjectId = null,
         uint? sourceStreamId = null)
     {
-        var entraForClients = sourceStreamId is uint sid
+        var resolvedEntraForClients = sourceStreamId is uint sid
             ? _participantManager.GetEntraOidForTranscript(sid)
             : (string.IsNullOrWhiteSpace(azureAdObjectId)
                 ? azureAdObjectId
                 : _participantManager.GetEntraObjectIdForTranscriptPayload(azureAdObjectId));
+        var entraForClients = !string.IsNullOrWhiteSpace(resolvedEntraForClients) &&
+                              (ParticipantManager.IsSyntheticParticipantId(resolvedEntraForClients) ||
+                               string.Equals(resolvedEntraForClients, AwsTranscribeService.UnknownMixedUserId, StringComparison.OrdinalIgnoreCase))
+            ? null
+            : resolvedEntraForClients;
         try
         {
             await _hubContext.Clients.All.SendAsync("transcript", new
@@ -69,7 +74,7 @@ public sealed class TranscriptBroadcaster
         {
             await _chunkManager.RecordFinalAsync(
                 utteranceUtc,
-                azureAdObjectId ?? string.Empty,
+                sourceStreamId is uint sourceSid ? _participantManager.GetEntraOidForTranscript(sourceSid) : (azureAdObjectId ?? string.Empty),
                 speakerLabel,
                 text,
                 dedupeKey,
