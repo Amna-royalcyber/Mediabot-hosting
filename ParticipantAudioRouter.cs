@@ -152,12 +152,6 @@ public sealed class ParticipantAudioRouter
                 continue;
             }
 
-            if (IsShortUtterancePcm(pcm))
-            {
-                _logger.LogDebug("Skipping low-confidence short utterance for source {SourceId} ({Bytes} bytes PCM).", sourceId, pcm.Length);
-                continue;
-            }
-
             _logger.LogDebug("Audio received from {ParticipantName} ({ParticipantId}).", displayName, participantId);
             await _awsTranscribeService.SendAudioChunkAsync(
                 sourceId,
@@ -205,7 +199,10 @@ public sealed class ParticipantAudioRouter
                 out var mixedDisplayName,
                 out var mixedUserIdWhenNoStream))
         {
-            return;
+            _logger.LogWarning("No attribution available — sending mixed audio with UNKNOWN speaker.");
+            mixedSourceId = null;
+            mixedDisplayName = "Speaker";
+            mixedUserIdWhenNoStream = null;
         }
 
         if (Interlocked.Increment(ref _loggedMixedMode) == 1)
@@ -419,9 +416,6 @@ public sealed class ParticipantAudioRouter
 
         return Convert.ToUInt32(ub.ActiveSpeakerId);
     }
-
-    /// <summary>~300 ms at 16 kHz mono PCM16 (conservative filter for coughs/clicks).</summary>
-    private static bool IsShortUtterancePcm(byte[] pcm) => pcm.Length < 9600;
 
     private void UpsertParticipantMappings(IParticipant participant, string botClientId)
     {

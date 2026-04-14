@@ -15,6 +15,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 {
     /// <summary>Session key for logs only; transcripts use <see cref="TranscriptFragment.SourceStreamId"/> or roster fallback.</summary>
     public const string DominantMixedSessionKey = "__dominant_mixed__";
+    public const string UnknownMixedUserId = "__unknown_mixed__";
 
     private readonly BotSettings _settings;
     private readonly TranscriptAggregator _transcriptAggregator;
@@ -182,7 +183,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         lock (_stateLock)
         {
             _mixedActiveSourceId = sourceStreamId;
-            _mixedDisplayName = string.IsNullOrWhiteSpace(displayName) ? "" : displayName.Trim();
+            _mixedDisplayName = string.IsNullOrWhiteSpace(displayName) ? "Speaker" : displayName.Trim();
             _mixedFallbackUserId = string.IsNullOrWhiteSpace(userIdWhenNoSourceStream)
                 ? null
                 : userIdWhenNoSourceStream.Trim();
@@ -359,12 +360,14 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
                 else if (_fixedSourceStreamId is null && _mixedFallbackUserId is not null)
                 {
                     userIdForBroadcast = _mixedFallbackUserId;
-                    displayName = _mixedDisplayName;
+                    displayName = string.IsNullOrWhiteSpace(_mixedDisplayName) ? "Speaker" : _mixedDisplayName;
                     sourceForFragment = null;
                 }
                 else
                 {
-                    continue;
+                    userIdForBroadcast = AwsTranscribeService.UnknownMixedUserId;
+                    displayName = string.IsNullOrWhiteSpace(_mixedDisplayName) ? "Speaker" : _mixedDisplayName;
+                    sourceForFragment = null;
                 }
             }
 
