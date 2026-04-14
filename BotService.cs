@@ -69,7 +69,7 @@ public sealed class BotService
     private readonly CallHandler _callHandler;
     private readonly MediaHandler _mediaHandler;
     private readonly ILogger<BotService> _logger;
-    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<ClientCredentialsAuthenticationProvider> _authLogger;
     private readonly IGraphLogger _graphLogger;
     private ICommunicationsClient? _communicationsClient;
     private bool _isInitialized;
@@ -80,13 +80,13 @@ public sealed class BotService
         BotSettings settings,
         CallHandler callHandler,
         MediaHandler mediaHandler,
-        ILoggerFactory loggerFactory,
+        ILogger<ClientCredentialsAuthenticationProvider> authLogger,
         ILogger<BotService> logger)
     {
         _settings = settings;
         _callHandler = callHandler;
         _mediaHandler = mediaHandler;
-        _loggerFactory = loggerFactory;
+        _authLogger = authLogger;
         _logger = logger;
         _graphLogger = new GraphLogger(_settings.ClientId);
     }
@@ -177,8 +177,7 @@ public sealed class BotService
             _settings.TenantId);
 
         var credential = new ClientSecretCredential(_settings.TenantId, _settings.ClientId, _settings.ClientSecret);
-        var authLogger = _loggerFactory.CreateLogger<ClientCredentialsAuthenticationProvider>();
-        var authProvider = new ClientCredentialsAuthenticationProvider(credential, _settings.TenantId, authLogger);
+        var authProvider = new ClientCredentialsAuthenticationProvider(credential, _settings.TenantId, _authLogger);
 
         // SDK requires BOTH: service base (origin) and notification (callback) URLs.
         // Bot:CallbackUrl / BOT_SERVICE_BASE_URL should be the full HTTPS callback, e.g. https://host/callback

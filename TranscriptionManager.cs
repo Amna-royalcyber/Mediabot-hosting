@@ -15,7 +15,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
     private readonly TranscriptAggregator _aggregator;
     private readonly MeetingParticipantService _meetingParticipants;
     private readonly ParticipantManager _participantManager;
-    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<TranscribeStreamService> _streamLogger;
     private readonly ILogger<TranscriptionManager> _logger;
     private readonly ConcurrentDictionary<uint, TranscribeStreamService> _streamsBySourceId = new();
     private readonly ConcurrentDictionary<uint, ParticipantIdentity> _participantBySourceId = new();
@@ -28,14 +28,14 @@ public sealed class TranscriptionManager : IAsyncDisposable
         TranscriptAggregator aggregator,
         MeetingParticipantService meetingParticipants,
         ParticipantManager participantManager,
-        ILoggerFactory loggerFactory,
+        ILogger<TranscribeStreamService> streamLogger,
         ILogger<TranscriptionManager> logger)
     {
         _settings = settings;
         _aggregator = aggregator;
         _meetingParticipants = meetingParticipants;
         _participantManager = participantManager;
-        _loggerFactory = loggerFactory;
+        _streamLogger = streamLogger;
         _logger = logger;
     }
 
@@ -101,7 +101,7 @@ public sealed class TranscriptionManager : IAsyncDisposable
                 _aggregator,
                 sourceId,
                 participant,
-                _loggerFactory.CreateLogger<TranscribeStreamService>());
+                _streamLogger);
             return s;
         });
 

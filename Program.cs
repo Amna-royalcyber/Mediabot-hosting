@@ -148,11 +148,11 @@ public static class Program
         }
 
         // Graph Communications notifications endpoint(s).
-        app.MapPost("/communications/calls", (HttpContext ctx, BotService botService, ILoggerFactory loggerFactory) =>
-            HandleGraphCallback(ctx, botService, loggerFactory.CreateLogger("GraphCommsNotifications")));
+        app.MapPost("/communications/calls", (HttpContext ctx, BotService botService, ILogger<BotService> log) =>
+            HandleGraphCallback(ctx, botService, log));
 
-        app.MapPost("/callback", (HttpContext ctx, BotService botService, ILoggerFactory loggerFactory) =>
-            HandleGraphCallback(ctx, botService, loggerFactory.CreateLogger("GraphCommsCallback")));
+        app.MapPost("/callback", (HttpContext ctx, BotService botService, ILogger<BotService> log) =>
+            HandleGraphCallback(ctx, botService, log));
 
         static async Task<IResult> HandleMeetingsApiJoin(
             HttpContext ctx,
@@ -226,12 +226,11 @@ public static class Program
             }
         }
 
-        app.MapPost("/api/meetings/join", async (HttpContext ctx, JoinMeetingRequest request, BotService botService, ILoggerFactory loggerFactory) =>
-            await HandleMeetingsApiJoin(ctx, request, botService, loggerFactory.CreateLogger("Join")));
+        app.MapPost("/api/meetings/join", async (HttpContext ctx, JoinMeetingRequest request, BotService botService, ILogger<CallHandler> log) =>
+            await HandleMeetingsApiJoin(ctx, request, botService, log));
 
-        app.MapPost("/api/bot/join", async (HttpContext ctx, JoinMeetingRequest request, BotService botService, ILoggerFactory loggerFactory) =>
+        app.MapPost("/api/bot/join", async (HttpContext ctx, JoinMeetingRequest request, BotService botService, ILogger<CallHandler> log) =>
         {
-            var log = loggerFactory.CreateLogger("Join");
             if (string.IsNullOrWhiteSpace(request.MeetingId) &&
                 string.IsNullOrWhiteSpace(request.MeetingJoinUrl) &&
                 string.IsNullOrWhiteSpace(request.ChatThreadId))

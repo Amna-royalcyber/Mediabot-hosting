@@ -20,23 +20,24 @@ public sealed class AwsTranscribeService : IAsyncDisposable
     private readonly BotSettings _settings;
     private readonly TranscriptAggregator _transcriptAggregator;
     private readonly ParticipantManager _participantManager;
-    private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger _participantSessionLogger;
     private readonly ILogger<AwsTranscribeService> _logger;
     private readonly ConcurrentDictionary<uint, ParticipantTranscribeSession> _sessionsBySourceId = new();
     private readonly object _mixedLock = new();
     private ParticipantTranscribeSession? _mixedDominantSession;
+    private volatile bool _isDisposing;
 
     public AwsTranscribeService(
         BotSettings settings,
         TranscriptAggregator transcriptAggregator,
         ParticipantManager participantManager,
-        ILoggerFactory loggerFactory,
+        ILogger<AwsTranscribeService> participantSessionLogger,
         ILogger<AwsTranscribeService> logger)
     {
         _settings = settings;
         _transcriptAggregator = transcriptAggregator;
         _participantManager = participantManager;
-        _loggerFactory = loggerFactory;
+        _participantSessionLogger = participantSessionLogger;
         _logger = logger;
     }
 
@@ -53,7 +54,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
     public async Task SendAudioChunkAsync(uint sourceId, string displayName, byte[] pcmAudio, long timestamp)
     {
-        if (pcmAudio.Length == 0)
+        if (_isDisposing || pcmAudio.Length == 0)
         {
             return;
         }
@@ -65,7 +66,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                 fixedSourceStreamId: sourceId,
                 _transcriptAggregator,
                 _participantManager,
-                _loggerFactory.CreateLogger<ParticipantTranscribeSession>()));
+                _participantSessionLogger));
 
         await session.EnsureStartedAsync();
         session.EnqueueAudio(pcmAudio, timestamp);
@@ -82,7 +83,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
         byte[] pcmAudio,
         long timestamp)
     {
-        if (pcmAudio.Length == 0)
+        if (_isDisposing || pcmAudio.Length == 0)
         {
             return;
         }
@@ -96,7 +97,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
                     fixedSourceStreamId: null,
                     _transcriptAggregator,
                     _participantManager,
-                    _loggerFactory.CreateLogger<ParticipantTranscribeSession>());
+                    _participantSessionLogger);
             }
 
             _mixedDominantSession.UpdateMixedDominantContext(sourceStreamId, displayName, userIdWhenNoSourceStream);
@@ -109,6 +110,7 @@ public sealed class AwsTranscribeService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _isDisposing = true;
         foreach (var session in _sessionsBySourceId.Values)
         {
             await session.DisposeAsync();
@@ -129,7 +131,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
     private readonly BotSettings _settings;
     private readonly TranscriptAggregator _transcriptAggregator;
     private readonly ParticipantManager _participantManager;
-    private readonly ILogger<ParticipantTranscribeSession> _logger;
+    private readonly ILogger _logger;
     private readonly bool _broadcastPartials;
 
     /// <summary>When set, all transcripts for this AWS stream belong to this MSI.</summary>
@@ -162,7 +164,7 @@ internal sealed class ParticipantTranscribeSession : IAsyncDisposable
         uint? fixedSourceStreamId,
         TranscriptAggregator transcriptAggregator,
         ParticipantManager participantManager,
-        ILogger<ParticipantTranscribeSession> logger)
+        ILogger logger)
     {
         _settings = settings;
         _fixedSourceStreamId = fixedSourceStreamId;

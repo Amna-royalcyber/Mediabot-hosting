@@ -51,7 +51,12 @@ public sealed class MediaHandler
         return mediaSession;
     }
 
-    private async void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs args)
+    private void OnAudioMediaReceived(object? sender, AudioMediaReceivedEventArgs args)
+    {
+        _ = ProcessAudioMediaReceivedAsync(args);
+    }
+
+    private async Task ProcessAudioMediaReceivedAsync(AudioMediaReceivedEventArgs args)
     {
         try
         {
