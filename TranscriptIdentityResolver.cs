@@ -59,6 +59,10 @@ public sealed class TranscriptIdentityResolver
             {
                 _participantManager.TryBindAudioSource(sourceId, lateOid, lateName, "RosterMediaStreamsMap");
                 _participantManager.TryGetBinding(sourceId, out binding);
+                if (binding is null)
+                {
+                    return (ParticipantManager.SyntheticParticipantId(sourceId), string.IsNullOrWhiteSpace(dn) ? "Speaker" : dn);
+                }
             }
 
             var uid = !string.IsNullOrWhiteSpace(binding.EntraOid)

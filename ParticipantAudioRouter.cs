@@ -128,7 +128,8 @@ public sealed class ParticipantAudioRouter
             {
                 if (!TryApplyRosterMediaStreamMap(sourceId, out participantId, out displayName))
                 {
-                    if (!TryInferBindingForUnmappedSource(sourceId, out participantId, out displayName))
+                    var roster = _meetingParticipants.GetRosterSnapshot();
+                    if (!TryInferBindingForUnmappedSource(sourceId, roster, out participantId, out displayName))
                     {
                         LogUnmappedSourceIdOnce(sourceId);
                         continue;
@@ -314,6 +315,7 @@ public sealed class ParticipantAudioRouter
     /// </summary>
     private bool TryInferBindingForUnmappedSource(
         uint sourceId,
+        IReadOnlyList<RosterParticipantDto> roster,
         out string participantId,
         out string displayName)
     {
@@ -324,6 +326,17 @@ public sealed class ParticipantAudioRouter
             if (_participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName))
             {
                 return true;
+            }
+
+            // Safe fast-bind: if there is exactly one human in roster, bind this MSI directly.
+            if (roster.Count == 1 && !string.IsNullOrWhiteSpace(roster[0].AzureAdObjectId))
+            {
+                var oid = roster[0].AzureAdObjectId.Trim();
+                var dn = string.IsNullOrWhiteSpace(roster[0].DisplayName) ? oid : roster[0].DisplayName.Trim();
+                _participantManager.TryBindAudioSource(sourceId, oid, dn, "RosterMediaStreamsMap");
+                _awsTranscribeService.UpsertParticipant(oid, dn);
+                _logger.LogInformation("Single-roster fast bind sourceId {SourceId} -> {DisplayName} ({EntraOid}).", sourceId, dn, oid);
+                return _participantManager.TryResolveAudioSource(sourceId, out participantId, out displayName);
             }
 
             if (Interlocked.Increment(ref _loggedMultiParticipantInferenceSkipped) == 1)
