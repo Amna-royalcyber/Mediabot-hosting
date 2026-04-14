@@ -21,6 +21,8 @@ public sealed class CallHandler
     private readonly TranscriptionChunkManager _transcriptionChunkManager;
     private readonly ILogger<CallHandler> _logger;
     private ICommunicationsClient? _communicationsClient;
+    private readonly object _activeCallLock = new();
+    private ICall? _activeCall;
 
     public CallHandler(
         BotSettings settings,
@@ -127,6 +129,15 @@ public sealed class CallHandler
             throw new InvalidOperationException("Communications client has not been initialized.");
         }
 
+        lock (_activeCallLock)
+        {
+            if (_activeCall is not null)
+            {
+                throw new InvalidOperationException(
+                    $"A meeting is already active (CallId={_activeCall.Id}). End the current meeting before starting a new join.");
+            }
+        }
+
         _logger.LogInformation("Joining with TenantId={TenantId}, Organizer={Organizer}", joinTenantId, organizerObjectId);
 
         // Align with Microsoft Graph comms samples (e.g. HueBot JoinCallAsync): 3-arg ctor + explicit scenario id.
@@ -196,6 +207,13 @@ public sealed class CallHandler
                      (stateStr.Equals("Terminated", StringComparison.OrdinalIgnoreCase) ||
                       stateStr.Equals("Disconnecting", StringComparison.OrdinalIgnoreCase)))
             {
+                lock (_activeCallLock)
+                {
+                    if (ReferenceEquals(_activeCall, call))
+                    {
+                        _activeCall = null;
+                    }
+                }
                 _transcriptionChunkManager.EndMeeting();
                 _meetingContext.ResetMeetingContext();
                 _logger.LogInformation("Call ended (State={State}); transcription chunk timer stopped for this meeting.", stateStr);
@@ -208,6 +226,10 @@ public sealed class CallHandler
         _transcriptionManager.AttachToCall(call, _settings.ClientId);
         _participantAudioRouter.AttachToCall(call, _settings.ClientId);
         _meetingContext.SetMeetingId(call.Id);
+        lock (_activeCallLock)
+        {
+            _activeCall = call;
+        }
 
         _logger.LogInformation("Join request submitted. Call ID: {CallId}, ScenarioId={ScenarioId}", call.Id, scenarioId);
         return call;

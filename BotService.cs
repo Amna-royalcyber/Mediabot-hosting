@@ -73,6 +73,8 @@ public sealed class BotService
     private readonly IGraphLogger _graphLogger;
     private ICommunicationsClient? _communicationsClient;
     private bool _isInitialized;
+    private readonly object _initLock = new();
+    private readonly SemaphoreSlim _joinGate = new(1, 1);
 
     public BotService(
         BotSettings settings,
@@ -97,40 +99,48 @@ public sealed class BotService
     /// </summary>
     public async Task JoinMeetingAsync(JoinMeetingRequest request)
     {
-        EnsureInitialized();
-        if (_communicationsClient is null)
+        await _joinGate.WaitAsync();
+        try
         {
-            throw new InvalidOperationException("Communications client is not initialized.");
-        }
+            EnsureInitialized();
+            if (_communicationsClient is null)
+            {
+                throw new InvalidOperationException("Communications client is not initialized.");
+            }
 
-        _logger.LogInformation("Joining Teams meeting (Graph Communications).");
+            _logger.LogInformation("Joining Teams meeting (Graph Communications).");
 
-        if (!string.IsNullOrWhiteSpace(request.MeetingJoinUrl))
-        {
-            await _callHandler.JoinMeetingByUrlAsync(request.MeetingJoinUrl.Trim(), _mediaHandler);
-        }
-        else if (!string.IsNullOrWhiteSpace(request.ChatThreadId) && !string.IsNullOrWhiteSpace(request.OrganizerObjectId))
-        {
-            var meetingTid = string.IsNullOrWhiteSpace(request.MeetingTenantId)
-                ? _settings.TenantId
-                : request.MeetingTenantId.Trim();
-            var messageId = string.IsNullOrWhiteSpace(request.ChatMessageId) ? "0" : request.ChatMessageId.Trim();
-            await _callHandler.JoinMeetingByCoordinatesAsync(
-                request.ChatThreadId.Trim(),
-                messageId,
-                request.OrganizerObjectId.Trim(),
-                meetingTid,
-                _mediaHandler);
-        }
-        else
-        {
-            throw new ArgumentException(
-                "Provide MeetingJoinUrl, or ChatThreadId and OrganizerObjectId (and optional MeetingTenantId, ChatMessageId). " +
-                "MeetingId alone cannot join a call via Graph Communications in this service.");
-        }
+            if (!string.IsNullOrWhiteSpace(request.MeetingJoinUrl))
+            {
+                await _callHandler.JoinMeetingByUrlAsync(request.MeetingJoinUrl.Trim(), _mediaHandler);
+            }
+            else if (!string.IsNullOrWhiteSpace(request.ChatThreadId) && !string.IsNullOrWhiteSpace(request.OrganizerObjectId))
+            {
+                var meetingTid = string.IsNullOrWhiteSpace(request.MeetingTenantId)
+                    ? _settings.TenantId
+                    : request.MeetingTenantId.Trim();
+                var messageId = string.IsNullOrWhiteSpace(request.ChatMessageId) ? "0" : request.ChatMessageId.Trim();
+                await _callHandler.JoinMeetingByCoordinatesAsync(
+                    request.ChatThreadId.Trim(),
+                    messageId,
+                    request.OrganizerObjectId.Trim(),
+                    meetingTid,
+                    _mediaHandler);
+            }
+            else
+            {
+                throw new ArgumentException(
+                    "Provide MeetingJoinUrl, or ChatThreadId and OrganizerObjectId (and optional MeetingTenantId, ChatMessageId). " +
+                    "MeetingId alone cannot join a call via Graph Communications in this service.");
+            }
 
-        _logger.LogInformation("Join request submitted to Graph.");
-        _logger.LogInformation("Per-participant Transcribe streams will start as unmixed audio arrives.");
+            _logger.LogInformation("Join request submitted to Graph.");
+            _logger.LogInformation("Per-participant Transcribe streams will start as unmixed audio arrives.");
+        }
+        finally
+        {
+            _joinGate.Release();
+        }
     }
 
     public Task<HttpResponseMessage> ProcessNotificationAsync(HttpRequestMessage request)
@@ -146,14 +156,17 @@ public sealed class BotService
 
     private void EnsureInitialized()
     {
-        if (_isInitialized)
+        lock (_initLock)
         {
-            return;
-        }
+            if (_isInitialized)
+            {
+                return;
+            }
 
-        _communicationsClient = CreateCommunicationsClient();
-        _callHandler.Initialize(_communicationsClient);
-        _isInitialized = true;
+            _communicationsClient = CreateCommunicationsClient();
+            _callHandler.Initialize(_communicationsClient);
+            _isInitialized = true;
+        }
     }
 
     private ICommunicationsClient CreateCommunicationsClient()
